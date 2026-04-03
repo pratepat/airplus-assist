@@ -1,0 +1,68 @@
+services:
+  ollama:
+    image: ollama/ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  chromadb:
+    image: chromadb/chroma
+    ports:
+      - "8000:8000"
+    volumes:
+      - chroma_data:/chroma/chroma
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    ports:
+      - "8001:8001"
+    env_file:
+      - .env
+    depends_on:
+      ollama:
+        condition: service_healthy
+      chromadb:
+        condition: service_started
+    restart: unless-stopped
+
+  ui:
+    build:
+      context: .
+      dockerfile: ui/Dockerfile
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    depends_on:
+      ollama:
+        condition: service_healthy
+      api:
+        condition: service_started
+    restart: unless-stopped
+
+  ingest:
+    build:
+      context: .
+      dockerfile: ingest/Dockerfile
+    volumes:
+      - ./docs:/app/docs:ro
+    env_file: .env
+    profiles: ["ingest"]
+    depends_on:
+      chromadb:
+        condition: service_started
+
+volumes:
+  ollama_data:
+  chroma_data:

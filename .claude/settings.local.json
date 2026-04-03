@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(chmod +x /Users/prateek/projects/airplus-assist/scripts/check_demo_ready.sh)",
+      "Bash(docker compose:*)",
+      "Bash(docker exec:*)",
+      "Bash(curl -sf http://localhost:11434/api/tags)",
+      "Bash(curl -sf http://localhost:8001/health)",
+      "Bash(curl -s http://localhost:8001/health)",
+      "Bash(python3 -m json.tool)",
+      "Bash(curl -s -X POST http://localhost:8001/ask -H 'Content-Type: application/json' -d '{\"question\":\"What is a program manager?\"}')"
+    ]
+  }
+}

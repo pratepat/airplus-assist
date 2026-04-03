@@ -1,0 +1,33 @@
+# Environment
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Docker volumes (local bind mounts if any)
+chroma_data/
+ollama_data/
+
+# Documents (add your own; don't commit proprietary docs)
+docs/*.pdf
+docs/*.docx
+docs/*.xlsx
+docs/*.txt
+!docs/urls.txt
+!docs/.gitkeep
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
