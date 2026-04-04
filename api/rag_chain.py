@@ -24,20 +24,35 @@ NO_ANSWER = "I don't have enough information in my knowledge base to answer this
 
 # ── System prompt template ────────────────────────────────────────────────────
 
-_SYSTEM_BASE = """You are AirPlus Assist, a precise knowledge assistant for AirPlus products.
+SYSTEM_PROMPT = """You are AirPlus Assist, a precise knowledge \
+assistant for AirPlus products.
 
 Answer the user's question using ONLY the context provided below.
+The context contains up to 5 ranked sources — source 1 is most \
+relevant, source 5 is least relevant.
 
 Rules:
-- If the answer is not in the context, respond exactly with:
-  "I don't have enough information in my knowledge base to answer this question."
+- Keep your answer under 150 words. Prefer shorter answers. \
+  If listing steps, use at most 5 steps.
+- Answer in 2-5 sentences maximum. Be direct and actionable.
+- If the answer requires steps, use a numbered list.
+- Use a bullet list only if listing 3 or more parallel items.
+- Do not repeat the question or say "Based on the context..."
 - Never use prior knowledge. Never speculate.
-- Never say "typically" or "generally" unless those exact words appear in the source context.
-- Be concise: answer in 2-4 sentences maximum.
-- Use a bullet list only if the answer contains 3 or more distinct items.
-- Do not repeat the question.
-- Do not say "Based on the context..." or "According to the provided information..."
-- Do not add caveats or suggest consulting other sources.
+- Never say "typically" or "generally" unless those exact words \
+  appear in the source context.
+
+Contradiction rule (IMPORTANT):
+- If two or more sources provide conflicting information on the \
+  same point, you MUST flag it using exactly this format:
+  "Note: Sources differ on this — [Source A label] states \
+  [X], while [Source B label] states [Y]."
+- Do not silently choose one source over another.
+- Show both conflicting statements.
+
+If the answer is not in the context, respond exactly with:
+"I don't have enough information in my knowledge base to \
+answer this question."
 {language_instruction}
 Context:
 {context}
@@ -120,9 +135,10 @@ class RagChain:
         self.collection_name  = os.environ["CHROMA_COLLECTION"]
         self.ollama_base_url  = os.environ["OLLAMA_BASE_URL"]
         self.ollama_model     = os.environ["OLLAMA_MODEL"]
-        self.top_k_retrieval  = int(os.environ.get("TOP_K_RETRIEVAL", 10))
-        self.top_k_rerank     = int(os.environ.get("TOP_K_RERANK", 3))
-        self.sim_threshold    = float(os.environ.get("SIMILARITY_THRESHOLD", 0.30))
+        self.top_k_retrieval   = int(os.environ.get("TOP_K_RETRIEVAL", 10))
+        self.top_k_rerank      = int(os.environ.get("TOP_K_RERANK", 3))
+        self.sim_threshold     = float(os.environ.get("SIMILARITY_THRESHOLD", 0.30))
+        self.rerank_threshold  = float(os.environ.get("RERANK_THRESHOLD", -0.50))
 
         log.info("Similarity threshold: %s", self.sim_threshold)
 
@@ -139,19 +155,53 @@ class RagChain:
     # ── Language helpers ──────────────────────────────────────────────────────
 
     def _translate_to_english(self, question: str) -> str:
-        """Translate question to English via Ollama. Returns original on failure."""
-        prompt = (
-            "Translate the following question to English. "
-            "Return only the translated question, nothing else.\n"
-            f"Question: {question}"
+        """
+        Translate question to English via Ollama.
+
+        Two-attempt strategy:
+          1. Primary prompt  — shorter, 30 s budget
+          2. Fallback prompt — simpler phrasing, configurable budget
+        Returns original question only if both attempts fail.
+        """
+        translation_timeout = float(os.getenv("TRANSLATION_TIMEOUT", "45"))
+
+        primary_prompt = (
+            "Translate to English. "
+            "Return only the translation, nothing else: "
+            f"{question}"
         )
+        fallback_prompt = f"English translation of: {question}"
+
+        # Attempt 1 — primary prompt, 30 s
         try:
-            result = self._ollama_raw(prompt, max_tokens=128)
+            result = self._ollama_raw(
+                primary_prompt, max_tokens=128, timeout=30.0, raise_on_timeout=True
+            )
             translated = result.strip()
             if translated:
                 return translated
         except Exception as exc:
-            log.warning("Question translation failed: %s — using original.", exc)
+            log.warning("Translation attempt 1 failed (%s) — trying fallback.", exc)
+
+        # Attempt 2 — fallback prompt, configurable timeout
+        try:
+            result = self._ollama_raw(
+                fallback_prompt,
+                max_tokens=128,
+                timeout=translation_timeout,
+                raise_on_timeout=True,
+            )
+            translated = result.strip()
+            if translated:
+                log.info("Translation succeeded on fallback attempt.")
+                return translated
+        except Exception as exc:
+            log.warning("Translation attempt 2 failed (%s).", exc)
+
+        log.warning(
+            "WARNING: Translation failed after both attempts, "
+            "using original question — retrieval quality may be reduced"
+        )
         return question
 
     def _detect_chunk_language(self, text: str) -> str:
@@ -280,11 +330,12 @@ class RagChain:
             key=lambda t: t[0],
             reverse=True,
         )
-        top              = ranked[: self.top_k_rerank]
+        top_chunks       = ranked[: self.top_k_rerank]
+        top              = top_chunks
         top_rerank_score = top[0][0]
 
-        # Re-ranker gate — primary hallucination guard
-        if top_rerank_score < -0.25:
+        # Re-ranker gate — filters irrelevant results after cosine similarity pass
+        if top_rerank_score < self.rerank_threshold:
             log.info(
                 "[AirPlus Assist] Q: %.60s | lang=%s | top_cosine=%.3f | "
                 "top_rerank=%.3f | gate=BLOCK | confidence=none",
@@ -300,34 +351,42 @@ class RagChain:
             question, language, top_sim, top_rerank_score, confidence,
         )
 
-        # Step 6 — build prompt with language instruction
+        # Step 6 — contradiction detection (conservative: 3+ distinct source files → flag)
+        unique_source_files = {
+            meta.get("source_file", "") for _, _, meta in top
+        }
+        has_contradiction = len(unique_source_files) >= 3
+
+        # Step 7 — build ranked context string and deduplicated sources list
         lang_instruction = self._build_language_instruction(language, top)
-        context_parts    = []
-        for _, doc, meta in top:
-            label = _build_label(meta)
-            context_parts.append(f"[Source: {label}]\n{doc}")
-        context = "\n---\n".join(context_parts)
-
-        system_prompt = _SYSTEM_BASE.format(
-            language_instruction=lang_instruction,
-            context=context,
-        )
-        full_prompt = system_prompt + f"\nQuestion: {original_question}"
-
-        # Step 7 — call Ollama
-        answer_text = self._ollama_raw(full_prompt, max_tokens=512)
-
-        # Step 8 — build sources (deduplicated)
+        context          = ""
         sources: list[SourceReference] = []
-        seen: set[str] = set()
-        for _, _doc, meta in top:
+        seen: set[str]  = set()
+        rank             = 0
+
+        for score, doc, meta in top:
             dk = _dedup_key(meta)
             if dk in seen:
                 continue
             seen.add(dk)
+            rank += 1
+
+            source_label = _build_label(meta)
+            context += f"[Source {rank}: {source_label}]\n{doc}\n\n---\n\n"
+
+            chunk_confidence: str
+            if score >= 3.0:
+                chunk_confidence = "high"
+            elif score >= 0.0:
+                chunk_confidence = "medium"
+            else:
+                chunk_confidence = "low"
+
             sources.append(SourceReference(
-                label         = _build_label(meta),
-                preview       = meta.get("chunk_preview") or _doc[:120],
+                rank          = rank,
+                label         = source_label,
+                excerpt       = doc[:200],
+                confidence    = chunk_confidence,
                 source_type   = meta.get("source_type", ""),
                 product       = meta.get("product", ""),
                 url           = _none_if_empty(meta.get("url")),
@@ -337,6 +396,15 @@ class RagChain:
                 ingested_at   = meta.get("ingested_at", ""),
             ))
 
+        system_prompt = SYSTEM_PROMPT.format(
+            language_instruction=lang_instruction,
+            context=context,
+        )
+        full_prompt = system_prompt + f"\nQuestion: {original_question}"
+
+        # Step 8 — call Ollama
+        answer_text = self._ollama_raw(full_prompt, max_tokens=512)
+
         return AskResponse(
             answer            = answer_text,
             confidence        = confidence,
@@ -345,6 +413,7 @@ class RagChain:
             original_question = original_question,
             retrieved_with    = retrieval_question,
             sources           = sources,
+            has_contradiction = has_contradiction,
         )
 
     # ── Private helpers ───────────────────────────────────────────────────────
@@ -364,10 +433,23 @@ class RagChain:
             original_question = original_question,
             retrieved_with    = retrieved_with,
             sources           = [],
+            has_contradiction = False,
         )
 
-    def _ollama_raw(self, prompt: str, max_tokens: int = 512) -> str:
-        """Send a prompt to Ollama and return the response text."""
+    def _ollama_raw(
+        self,
+        prompt: str,
+        max_tokens: int = 512,
+        timeout: float = 120.0,
+        raise_on_timeout: bool = False,
+    ) -> str:
+        """
+        Send a prompt to Ollama and return the response text.
+
+        When raise_on_timeout=True the caller receives the raw
+        httpx.TimeoutException instead of a user-facing string —
+        used by translation retries so they can attempt a fallback.
+        """
         url     = f"{self.ollama_base_url}/api/generate"
         payload = {
             "model":  self.ollama_model,
@@ -380,11 +462,13 @@ class RagChain:
             },
         }
         try:
-            with httpx.Client(timeout=60.0) as client:
+            with httpx.Client(timeout=timeout) as client:
                 resp = client.post(url, json=payload)
                 resp.raise_for_status()
                 return resp.json()["response"].strip()
         except httpx.TimeoutException:
+            if raise_on_timeout:
+                raise
             log.error("Ollama request timed out.")
             return "The language model did not respond in time. Please try again."
         except Exception as exc:

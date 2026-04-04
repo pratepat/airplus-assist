@@ -5,17 +5,27 @@ Uses openpyxl to read any Excel file with a Key column.
 Column discovery is fully dynamic — no column names are hardcoded.
 Columns ending in "Approved" or "Approved?" are skipped (status flags).
 
-One row = one chunk. Chunk content is a structured text block:
+One row = one chunk. Chunk content is a natural-language text block:
   Term: {key}
-  {col1}: {val1}
-  {col2}: {val2}
-  ...
+  You can find this in: {location} section   ← location/context cols
+  Definition (English): {value}              ← language code cols
+  {col_name}: {value}                        ← all other cols (fallback)
 Empty/NaN values are omitted from the block.
 """
 
 import openpyxl
 from datetime import datetime, timezone
 from pathlib import Path
+
+# Mapping from 2-letter language codes to full names used in output
+_LANG_CODES = {
+    "EN": "English",
+    "DE": "German",
+    "FR": "French",
+    "ES": "Spanish",
+    "IT": "Italian",
+    "NL": "Dutch",
+}
 
 
 def _is_approved_col(name: str) -> bool:
@@ -31,6 +41,31 @@ def _cell_value(cell) -> str | None:
         return None
     s = str(v).strip()
     return s if s else None
+
+
+def _format_line(col_name: str, col_val: str) -> str:
+    """
+    Apply natural-language transformations to a column/value pair.
+
+    Rules (checked in order):
+    1. 2-letter language code (EN/DE/FR/ES/IT/NL)
+       → "Definition (English): value"
+    2. Column name contains "location" or "context" (case-insensitive)
+       → "You can find this in: value section"
+    3. All other columns
+       → "{col_name}: value"   (unchanged fallback)
+    """
+    name = col_name.strip()
+    upper = name.upper()
+    lower = name.lower()
+
+    if upper in _LANG_CODES:
+        return f"Definition ({_LANG_CODES[upper]}): {col_val}"
+
+    if "location" in lower or "context" in lower:
+        return f"You can find this in: {col_val} section"
+
+    return f"{name}: {col_val}"
 
 
 def parse_excel(file_path: Path, product: str) -> list[dict]:
@@ -81,9 +116,13 @@ def parse_excel(file_path: Path, product: str) -> list[dict]:
                 col_name = headers[col_idx]
                 col_val = _cell_value(row[col_idx])
                 if col_val:
-                    lines.append(f"{col_name}: {col_val}")
+                    lines.append(_format_line(col_name, col_val))
 
             content = "\n".join(lines)
+
+            # Verification print for specific key
+            if key_val == "dataplus.attribute.FLIGHT_COUPON_FARE_BASIS_CODE":
+                print(f"\n[VERIFY] {file_path.name} / {sheet_name}:\n{content}\n")
             results.append({
                 "content": content,
                 "metadata": {

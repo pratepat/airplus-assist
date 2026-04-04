@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import os
-import subprocess
 from contextlib import asynccontextmanager
 
 import chromadb
@@ -84,12 +83,23 @@ def _require_chain() -> RagChain:
 
 @app.get("/health")
 def health():
-    ollama_model     = os.environ.get("OLLAMA_MODEL", "unknown")
-    collection_name  = os.environ.get("CHROMA_COLLECTION", "unknown")
-    chroma_ok = True
+    ollama_model    = os.environ.get("OLLAMA_MODEL", "unknown")
+    collection_name = os.environ.get("CHROMA_COLLECTION", "unknown")
+    chroma_ok       = True
+    chunk_count     = 0
+    last_ingested   = "Unknown"
     try:
-        client = _chroma_client()
+        client     = _chroma_client()
         client.heartbeat()
+        collection = client.get_collection(collection_name)
+        chunk_count = collection.count()
+        results = collection.get(
+            limit=1,
+            include=["metadatas"],
+            where={"ingested_at": {"$ne": ""}},
+        )
+        if results["metadatas"]:
+            last_ingested = results["metadatas"][0].get("ingested_at", "Unknown")
     except Exception:
         chroma_ok = False
 
@@ -99,9 +109,11 @@ def health():
             detail={"status": "degraded", "chromadb": "unreachable"},
         )
     return {
-        "status":     "ok",
-        "model":      ollama_model,
-        "collection": collection_name,
+        "status":        "ok",
+        "model":         ollama_model,
+        "collection":    collection_name,
+        "chunk_count":   chunk_count,
+        "last_ingested": last_ingested,
     }
 
 
@@ -145,21 +157,12 @@ def products():
 
 @app.post("/ingest", response_model=IngestStatus)
 def ingest():
-    """Trigger a re-ingest run by executing build_vectorstore.py as a subprocess."""
-    try:
-        result = subprocess.run(
-            ["python", "/ingest/build_vectorstore.py"],
-            capture_output=True,
-            text=True,
-            timeout=600,
-        )
-        if result.returncode == 0:
-            return IngestStatus(status="ok", message=result.stdout[-2000:])
-        return IngestStatus(
-            status="error",
-            message=result.stderr[-2000:] or result.stdout[-2000:],
-        )
-    except subprocess.TimeoutExpired:
-        return IngestStatus(status="error", message="Ingest timed out after 600 seconds.")
-    except Exception as exc:
-        return IngestStatus(status="error", message=str(exc))
+    """Ingest runs as a separate container — return clear guidance."""
+    return IngestStatus(
+        status="error",
+        message=(
+            "Ingest service runs separately. "
+            "Use: docker compose --profile ingest "
+            "run --rm ingest python build_vectorstore.py"
+        ),
+    )

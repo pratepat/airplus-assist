@@ -21,8 +21,10 @@ class AskRequest(BaseModel):
 
 
 class SourceReference(BaseModel):
+    rank: int                    # 1-5, position after re-ranking
     label: str                   # human-readable e.g. "glossary.xlsx — Term: Payment"
-    preview: str                 # first 120 chars of the chunk
+    excerpt: str                 # up to 200 chars of chunk content
+    confidence: str              # "high" | "medium" | "low"
     source_type: str             # "pdf" | "xlsx" | "url" | "docx" | "txt"
     product: str
     url: Optional[str] = None
@@ -40,6 +42,7 @@ class AskResponse(BaseModel):
     original_question: str       # the question as typed by the user
     retrieved_with: str          # question used for retrieval (translated if non-EN)
     sources: List[SourceReference]
+    has_contradiction: bool = False  # True if LLM detected conflict across sources
 
 
 class IngestStatus(BaseModel):
