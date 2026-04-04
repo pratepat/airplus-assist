@@ -730,6 +730,7 @@ with st.sidebar:
         key="product_select",
     )
     selected_product = product_key(prod_display)
+    st.session_state.product = selected_product  # keep session state in sync
 
     # Clear conversation button
     if st.button(
@@ -836,51 +837,9 @@ elif st.session_state.suggested_question:
     question_to_process = st.session_state.suggested_question
     st.session_state.suggested_question = None
 
-# ── Replay chat history ───────────────────────────────────────────────────────
-
-for msg in st.session_state.messages:
-    if msg["role"] == "user":
-        if msg.get("content"):
-            with st.chat_message("user", avatar="👤"):
-                st.markdown(msg["content"])
-    elif msg["role"] == "assistant" and msg.get("answer") is not None:
-        with st.chat_message("assistant", avatar="🤖"):
-            if msg.get("is_meta"):
-                render_meta_answer(msg)
-            else:
-                render_assistant_message(msg)
-
-# ── Persistent fallback button ────────────────────────────────────────────────
-# Rendered every run so clicks are always registered in the widget tree.
-# Only shown when idle (no new question is being processed).
-
-if st.session_state.show_fallback and question_to_process is None:
-    fb = st.session_state.show_fallback
-    with st.chat_message("assistant", avatar="🤖"):
-        prod_label = display_name(fb["product"])
-        st.markdown(f"""
-<div style="background:#EFF6FF;border:1px solid #BFDBFE;
-            border-radius:8px;padding:12px 16px;
-            font-size:13px;color:#1E40AF;">
-  🔍 <b>Not finding what you need in {prod_label}?</b><br>
-  <span style="color:#6B7280;font-size:12px;">
-  Try searching across all products for a broader result.
-  </span>
-</div>
-""", unsafe_allow_html=True)
-        if st.button(
-            "Search in All Products →",
-            key="search_all_persistent",
-            type="secondary",
-        ):
-            st.session_state.retry_question = fb["question"]
-            st.session_state.retry_product  = None
-            st.session_state.show_fallback  = None
-            st.rerun()
-
 # ── Welcome state ─────────────────────────────────────────────────────────────
 
-if not st.session_state.messages and question_to_process is None:
+if len(st.session_state.messages) == 0 and question_to_process is None:
     st.markdown("""
 <div style="margin: 40px auto;max-width:600px;">
   <div style="text-align:center;margin-bottom:32px;">
@@ -913,6 +872,20 @@ if not st.session_state.messages and question_to_process is None:
         if st.button("📞 What are the help channels?", use_container_width=True):
             st.session_state.suggested_question = "What are the help channels?"
             st.rerun()
+
+# ── Replay chat history ───────────────────────────────────────────────────────
+
+for msg in st.session_state.messages:
+    if msg["role"] == "user":
+        if msg.get("content"):
+            with st.chat_message("user", avatar="👤"):
+                st.markdown(msg["content"])
+    elif msg["role"] == "assistant" and msg.get("answer") is not None:
+        with st.chat_message("assistant", avatar="🤖"):
+            if msg.get("is_meta"):
+                render_meta_answer(msg)
+            else:
+                render_assistant_message(msg)
 
 # ── Chat input ────────────────────────────────────────────────────────────────
 
@@ -963,33 +936,6 @@ if question_to_process:
             if response is not None:
                 render_assistant_message({**response, "response_time": elapsed})
 
-                # ── Fallback: Search in All Products ─────────────────────────
-                conf = response.get("confidence", "none")
-                if effective_product is not None and conf in ("none", "low"):
-                    prod_display = display_name(effective_product)
-                    msg_count   = len(st.session_state.messages)
-                    st.markdown("<div style='margin-top:16px;'></div>",
-                                unsafe_allow_html=True)
-                    st.markdown(f"""
-<div style="background:#EFF6FF;border:1px solid #BFDBFE;
-            border-radius:8px;padding:12px 16px;
-            font-size:13px;color:#1E40AF;">
-  🔍 <b>Not finding what you need in {prod_display}?</b><br>
-  <span style="color:#6B7280;font-size:12px;">
-  Try searching across all products for a broader result.
-  </span>
-</div>
-""", unsafe_allow_html=True)
-                    if st.button(
-                        "Search in All Products →",
-                        key=f"search_all_{msg_count}",
-                        type="secondary",
-                    ):
-                        st.session_state.retry_question = question_to_process
-                        st.session_state.retry_product  = None
-                        st.rerun()
-                # ─────────────────────────────────────────────────────────────
-
                 st.session_state.messages.append({
                     "role":             "assistant",
                     "confidence":       response.get("confidence", "none"),
@@ -1010,3 +956,39 @@ if question_to_process:
                     "product_scope":    "all",
                     "response_time":    elapsed,
                 })
+
+# ── Fallback: Search in All Products ─────────────────────────────────────────
+# Must run AFTER the question processing block so the freshly appended message
+# is visible in st.session_state.messages when the condition is evaluated.
+
+_last_assistant = None
+for _msg in reversed(st.session_state.messages):
+    if _msg["role"] == "assistant":
+        _last_assistant = _msg
+        break
+
+if (
+    _last_assistant
+    and not _last_assistant.get("is_meta", False)
+    and _last_assistant.get("confidence") in ("none", "low")
+    and st.session_state.product is not None
+):
+    _prod_label = display_name(st.session_state.product)
+    st.markdown(f"""
+<div style="background:#EFF6FF;border:1px solid #BFDBFE;
+            border-radius:8px;padding:12px 16px;
+            font-size:13px;color:#1E40AF;margin:8px 0 4px 0;">
+  🔍 <b>Not finding what you need in {_prod_label}?</b><br>
+  <span style="color:#6B7280;font-size:12px;">
+  Try searching across all products for a broader result.
+  </span>
+</div>
+""", unsafe_allow_html=True)
+    if st.button(
+        "Search in All Products →",
+        key="search_all_persistent",
+        type="secondary",
+    ):
+        st.session_state.retry_question = st.session_state.last_question
+        st.session_state.retry_product  = None
+        st.rerun()

@@ -1,33 +1,74 @@
-# Environment
+# Environment variables - never commit real values
 .env
 
 # Python
 __pycache__/
 *.py[cod]
-*.pyo
+*$py.class
+*.so
+.Python
+*.egg
 *.egg-info/
 dist/
 build/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.whl
+.installed.cfg
+
+# Virtual environments
 .venv/
 venv/
+ENV/
+env/
 
-# Docker volumes (local bind mounts if any)
-chroma_data/
-ollama_data/
-
-# Documents (add your own; don't commit proprietary docs)
-docs/*.pdf
-docs/*.docx
-docs/*.xlsx
-docs/*.txt
-!docs/urls.txt
-!docs/.gitkeep
-
-# OS
-.DS_Store
-Thumbs.db
-
-# IDE
+# VS Code
 .vscode/
-.idea/
-*.swp
+*.code-workspace
+
+# Mac OS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+
+# Docker volumes (local data)
+volumes/
+chroma_data/
+
+# Documents - never commit real business documents
+docs/**/**.pdf
+docs/**/**.docx
+docs/**/**.xlsx
+docs/**/**.txt
+# But keep the folder structure and urls.txt template
+!docs/**/.gitkeep
+!docs/**/urls.txt
+
+# Logs
+*.log
+logs/
+
+# Test outputs
+test_output/
+*.tmp
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Byte-compiled
+*.pyc
+*.pyo
