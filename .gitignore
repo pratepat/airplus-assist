@@ -72,3 +72,6 @@ test_output/
 # Byte-compiled
 *.pyc
 *.pyo
+.claude/
+*.rtf
+~

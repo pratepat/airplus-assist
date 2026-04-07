@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 from typing import Optional
@@ -263,7 +264,101 @@ class RagChain:
             return "\n" + "\n".join(parts) + "\n"
         return "\n"
 
-    # ── Public entry point ────────────────────────────────────────────────────
+    # ── Retrieval helpers ─────────────────────────────────────────────────────
+
+    def generate_reply(
+        self,
+        original_text: str,
+        answered_results: list,
+        language: str = "EN",
+    ) -> str:
+        """Generate a professional email/chat reply combining all answered Q&A pairs."""
+        import re
+
+        # Extract sender name from sign-off lines (last 5 lines)
+        sender_name = None
+        name_patterns = [
+            r"(?:thanks|thank you|regards|best|cheers|sincerely|kind regards)[,\s]+([A-Z][a-z]+)",
+            r"^([A-Z][a-z]+)\s*$",
+        ]
+        for line in reversed(original_text.strip().split("\n")[-5:]):
+            line = line.strip()
+            for pattern in name_patterns:
+                match = re.search(pattern, line, re.IGNORECASE)
+                if match:
+                    sender_name = match.group(1)
+                    break
+            if sender_name:
+                break
+
+        # Build Q&A context block
+        qa_pairs = ""
+        for r in answered_results:
+            qa_pairs += f"Question: {r['current_question']}\nAnswer: {r['answer']}\n\n"
+
+        greeting = f"Hi {sender_name}" if sender_name else "Dear Customer"
+
+        prompt = (
+            f'You are writing a professional email reply on behalf of AirPlus customer support.\n\n'
+            f'Write a reply to the following message using ONLY the provided answers below.\n\n'
+            f'Rules:\n'
+            f'- Start with: "{greeting},"\n'
+            f'- Write in the same language as the original message\n'
+            f'- Combine the answers into natural flowing prose\n'
+            f'- Do not use numbered lists — write as paragraphs\n'
+            f'- Professional but warm tone — not robotic\n'
+            f'- Do not mention AI, knowledge base, or any tool\n'
+            f'- Do not add information beyond what is in the answers\n'
+            f'- End with: "Best regards,\\n[AirPlus Support]"\n'
+            f'- Keep the reply concise — one paragraph per question\n\n'
+            f'Original message:\n{original_text}\n\n'
+            f'Answers to include in reply:\n{qa_pairs}\n'
+            f'Write the reply now:'
+        )
+
+        return self._ollama_raw(prompt, max_tokens=1024, timeout=120.0)
+
+    def _retrieve_and_rerank(
+        self,
+        retrieval_question: str,
+        product: Optional[str],
+    ) -> tuple[list, list, list, float] | None:
+        """
+        Embed, query ChromaDB, and re-rank.
+        Returns (ranked_chunks, documents, metadatas, top_sim) or None on failure/no-results.
+        """
+        q_vec = self._embed.encode(
+            [retrieval_question], convert_to_numpy=True
+        )[0].tolist()
+
+        query_kwargs: dict = dict(
+            query_embeddings=[q_vec],
+            n_results=self.top_k_retrieval,
+            include=["documents", "metadatas", "distances"],
+        )
+        if product:
+            query_kwargs["where"] = {"product": {"$eq": product}}
+
+        try:
+            col     = self._collection()
+            results = col.query(**query_kwargs)
+        except Exception as exc:
+            log.error("ChromaDB query failed: %s", exc)
+            return None
+
+        documents = results["documents"][0]
+        metadatas = results["metadatas"][0]
+        distances = results["distances"][0]
+
+        if not documents:
+            return None
+
+        sim_scores = [1.0 - (d / 2.0) for d in distances]
+        top_sim    = sim_scores[0]
+
+        return documents, metadatas, distances, top_sim
+
+    # ── Public entry points ───────────────────────────────────────────────────
 
     def ask(
         self,
@@ -281,38 +376,14 @@ class RagChain:
         else:
             retrieval_question = question
 
-        # Step 2 — embed the (possibly translated) question
-        q_vec = self._embed.encode(
-            [retrieval_question], convert_to_numpy=True
-        )[0].tolist()
-
-        # Step 3 — retrieve from ChromaDB
-        query_kwargs: dict = dict(
-            query_embeddings=[q_vec],
-            n_results=self.top_k_retrieval,
-            include=["documents", "metadatas", "distances"],
-        )
-        if product:
-            query_kwargs["where"] = {"product": {"$eq": product}}
-
-        try:
-            col     = self._collection()
-            results = col.query(**query_kwargs)
-        except Exception as exc:
-            log.error("ChromaDB query failed: %s", exc)
+        # Steps 2-3 — embed and retrieve
+        retrieved = self._retrieve_and_rerank(retrieval_question, product)
+        if retrieved is None:
             return self._no_answer(product_scope, language, original_question, retrieval_question)
 
-        documents = results["documents"][0]
-        metadatas = results["metadatas"][0]
-        distances = results["distances"][0]
+        documents, metadatas, distances, top_sim = retrieved
 
-        if not documents:
-            return self._no_answer(product_scope, language, original_question, retrieval_question)
-
-        # Step 4 — cosine similarity gate (coarse filter)
-        sim_scores = [1.0 - (d / 2.0) for d in distances]
-        top_sim    = sim_scores[0]
-
+        # Step 4 — cosine similarity gate
         if top_sim < self.sim_threshold:
             log.info(
                 "[AirPlus Assist] Q: %.60s | lang=%s | top_cosine=%.3f | "
@@ -321,7 +392,7 @@ class RagChain:
             )
             return self._no_answer(product_scope, language, original_question, retrieval_question)
 
-        # Step 5 — re-rank using the English retrieval question
+        # Step 5 — re-rank
         pairs         = [(retrieval_question, doc) for doc in documents]
         rerank_scores = self._rerank.predict(pairs).tolist()
 
@@ -331,10 +402,8 @@ class RagChain:
             reverse=True,
         )
         top_chunks       = ranked[: self.top_k_rerank]
-        top              = top_chunks
-        top_rerank_score = top[0][0]
+        top_rerank_score = top_chunks[0][0]
 
-        # Re-ranker gate — filters irrelevant results after cosine similarity pass
         if top_rerank_score < self.rerank_threshold:
             log.info(
                 "[AirPlus Assist] Q: %.60s | lang=%s | top_cosine=%.3f | "
@@ -343,6 +412,232 @@ class RagChain:
             )
             return self._no_answer(product_scope, language, original_question, retrieval_question)
 
+        # Steps 6-8 — build context, call LLM
+        return self._generate_answer(
+            question=original_question,
+            retrieval_question=retrieval_question,
+            language=language,
+            product_scope=product_scope,
+            top_chunks=top_chunks,
+            top_rerank_score=top_rerank_score,
+            top_sim=top_sim,
+        )
+
+    def ask_streaming(
+        self,
+        question: str,
+        product: Optional[str],
+        language: str = "EN",
+    ):
+        """
+        Generator that yields SSE stage events then the final result.
+        Each event is a 'data: {...}\\n\\n' string for text/event-stream.
+        """
+        product_scope     = product if product else "all"
+        original_question = question
+
+        def event(data: dict) -> str:
+            return f"data: {json.dumps(data)}\n\n"
+
+        try:
+            # Stage 1 — always first
+            yield event({"stage": "searching", "message": "Searching knowledge base...", "icon": "🔍"})
+
+            # Translation for non-EN
+            retrieval_question = question
+            if language != "EN":
+                yield event({"stage": "translating", "message": "Translating question to English...", "icon": "🌐"})
+                retrieval_question = self._translate_to_english(question)
+                log.info("Translated question: %r → %r", question, retrieval_question)
+
+            # Embed and retrieve
+            retrieved = self._retrieve_and_rerank(retrieval_question, product)
+            if retrieved is None:
+                yield event({"stage": "complete", "result": self._no_answer(
+                    product_scope, language, original_question, retrieval_question
+                ).dict()})
+                return
+
+            documents, metadatas, distances, top_sim = retrieved
+
+            # Cosine similarity gate
+            if top_sim < self.sim_threshold:
+                log.info(
+                    "[AirPlus Assist] Q: %.60s | lang=%s | top_cosine=%.3f | "
+                    "top_rerank=n/a | gate=BLOCK | confidence=none",
+                    question, language, top_sim,
+                )
+                yield event({"stage": "complete", "result": self._no_answer(
+                    product_scope, language, original_question, retrieval_question
+                ).dict()})
+                return
+
+            # Stage 2 — after retrieval, before re-rank
+            yield event({
+                "stage":   "retrieved",
+                "message": f"Found {len(documents)} relevant sources. Re-ranking...",
+                "icon":    "📚",
+            })
+
+            # Re-rank
+            pairs         = [(retrieval_question, doc) for doc in documents]
+            rerank_scores = self._rerank.predict(pairs).tolist()
+
+            ranked = sorted(
+                zip(rerank_scores, documents, metadatas),
+                key=lambda t: t[0],
+                reverse=True,
+            )
+            top_chunks       = ranked[: self.top_k_rerank]
+            top_rerank_score = top_chunks[0][0]
+
+            # Re-ranker gate
+            if top_rerank_score < self.rerank_threshold:
+                log.info(
+                    "[AirPlus Assist] Q: %.60s | lang=%s | top_cosine=%.3f | "
+                    "top_rerank=%.3f | gate=BLOCK | confidence=none",
+                    question, language, top_sim, top_rerank_score,
+                )
+                yield event({"stage": "complete", "result": self._no_answer(
+                    product_scope, language, original_question, retrieval_question
+                ).dict()})
+                return
+
+            # Stage 3 — gate passed, calling LLM
+            model_display = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
+            yield event({
+                "stage":   "generating",
+                "message": f"Generating answer with {model_display}...",
+                "icon":    "🤖",
+            })
+
+            response = self._generate_answer(
+                question=original_question,
+                retrieval_question=retrieval_question,
+                language=language,
+                product_scope=product_scope,
+                top_chunks=top_chunks,
+                top_rerank_score=top_rerank_score,
+                top_sim=top_sim,
+            )
+
+            yield event({"stage": "complete", "result": response.dict()})
+
+        except Exception as e:
+            log.error("ask_streaming failed: %s", e)
+            yield event({"stage": "error", "message": f"Something went wrong: {str(e)}"})
+
+    # ── Private helpers ───────────────────────────────────────────────────────
+
+    def extract_questions(self, text: str, max_questions: int = 5) -> list[str]:
+        """
+        Use Ollama to extract distinct questions from unstructured email or chat text.
+        Returns a list of question strings (max 5).
+        """
+        prompt = (
+            f"Extract all distinct questions from the following message and rewrite "
+            f"each one as a clear, direct question suitable for searching a knowledge base.\n\n"
+            f"Rules:\n"
+            f"- Convert implicit and indirect questions to explicit how/what questions\n"
+            f"  e.g. \"I can't figure out how to X\" → \"How do I X?\"\n"
+            f"  e.g. \"I'm not sure about Y\" → \"What is Y?\"\n"
+            f"  e.g. \"Could you tell me about Z\" → \"What is Z?\"\n"
+            f"  e.g. \"Can I do X?\" → \"How do I X?\"\n"
+            f"  e.g. \"Is it possible to X?\" → \"How do I X?\"\n"
+            f"  e.g. \"I'm wondering if I can X\" → \"How do I X?\"\n"
+            f"- Return ONLY a JSON array of rewritten question strings\n"
+            f"- Maximum {max_questions} questions\n"
+            f"- Deduplicate similar questions — keep only one\n"
+            f"- Preserve the original language of each question\n"
+            f"- Remove greetings, sign-offs, pleasantries\n"
+            f"- Do not include statements that are not questions\n"
+            f"- Do not add explanation or preamble — JSON array only\n"
+            f"- Each question should be concise and direct\n\n"
+            f"Message:\n{text}\n\n"
+            f"JSON array of clear, direct questions:"
+        )
+
+        try:
+            raw = self._ollama_raw(prompt, max_tokens=512, timeout=60.0)
+        except Exception as exc:
+            log.error("extract_questions Ollama call failed: %s", exc)
+            return []
+
+        raw = raw.strip()
+
+        # Strip markdown code fences if present
+        if raw.startswith("```"):
+            parts = raw.split("```")
+            raw = parts[1] if len(parts) > 1 else ""
+            if raw.startswith("json"):
+                raw = raw[4:]
+        raw = raw.strip()
+
+        try:
+            questions = json.loads(raw)
+            if not isinstance(questions, list):
+                return []
+            return [str(q) for q in questions if str(q).strip()][:max_questions]
+        except json.JSONDecodeError:
+            log.warning("extract_questions: could not parse JSON from: %r", raw[:200])
+            return []
+
+    def analyse(
+        self,
+        text: str,
+        product: Optional[str],
+        language: str = "EN",
+        max_questions: int = 5,
+    ) -> dict:
+        """Extract questions from text and answer each one."""
+        import time
+        start = time.time()
+
+        questions = self.extract_questions(text, max_questions)
+
+        if not questions:
+            return {
+                "questions_found":       0,
+                "original_text_length":  len(text),
+                "language":              language,
+                "results":               [],
+                "processing_time_seconds": round(time.time() - start, 1),
+            }
+
+        results = []
+        for i, question in enumerate(questions, 1):
+            answer = self.ask(question=question, product=product, language=language)
+            results.append({
+                "question_number":    i,
+                "extracted_question": question,
+                "current_question":   question,
+                "answer":             answer.answer,
+                "confidence":         answer.confidence,
+                "sources":            [s.dict() for s in answer.sources],
+                "has_contradiction":  answer.has_contradiction,
+                "product_scope":      answer.product_scope,
+                "answered":           answer.confidence != "none",
+            })
+
+        return {
+            "questions_found":       len(questions),
+            "original_text_length":  len(text),
+            "language":              language,
+            "results":               results,
+            "processing_time_seconds": round(time.time() - start, 1),
+        }
+
+    def _generate_answer(
+        self,
+        question: str,
+        retrieval_question: str,
+        language: str,
+        product_scope: str,
+        top_chunks: list,
+        top_rerank_score: float,
+        top_sim: float,
+    ) -> AskResponse:
+        """Build context, call Ollama, return AskResponse. Called by ask() and ask_streaming()."""
         confidence = "high" if top_rerank_score >= 3.0 else "medium"
 
         log.info(
@@ -351,20 +646,18 @@ class RagChain:
             question, language, top_sim, top_rerank_score, confidence,
         )
 
-        # Step 6 — contradiction detection (conservative: 3+ distinct source files → flag)
-        unique_source_files = {
-            meta.get("source_file", "") for _, _, meta in top
-        }
-        has_contradiction = len(unique_source_files) >= 3
+        # Contradiction detection (conservative: 3+ distinct source files → flag)
+        unique_source_files = {meta.get("source_file", "") for _, _, meta in top_chunks}
+        has_contradiction   = len(unique_source_files) >= 3
 
-        # Step 7 — build ranked context string and deduplicated sources list
-        lang_instruction = self._build_language_instruction(language, top)
+        # Build ranked context string and deduplicated sources list
+        lang_instruction = self._build_language_instruction(language, top_chunks)
         context          = ""
         sources: list[SourceReference] = []
         seen: set[str]  = set()
         rank             = 0
 
-        for score, doc, meta in top:
+        for score, doc, meta in top_chunks:
             dk = _dedup_key(meta)
             if dk in seen:
                 continue
@@ -374,7 +667,6 @@ class RagChain:
             source_label = _build_label(meta)
             context += f"[Source {rank}: {source_label}]\n{doc}\n\n---\n\n"
 
-            chunk_confidence: str
             if score >= 3.0:
                 chunk_confidence = "high"
             elif score >= 0.0:
@@ -400,9 +692,8 @@ class RagChain:
             language_instruction=lang_instruction,
             context=context,
         )
-        full_prompt = system_prompt + f"\nQuestion: {original_question}"
+        full_prompt = system_prompt + f"\nQuestion: {question}"
 
-        # Step 8 — call Ollama
         answer_text = self._ollama_raw(full_prompt, max_tokens=512)
 
         return AskResponse(
@@ -410,13 +701,11 @@ class RagChain:
             confidence        = confidence,
             product_scope     = product_scope,
             language          = language,
-            original_question = original_question,
+            original_question = question,
             retrieved_with    = retrieval_question,
             sources           = sources,
             has_contradiction = has_contradiction,
         )
-
-    # ── Private helpers ───────────────────────────────────────────────────────
 
     def _no_answer(
         self,

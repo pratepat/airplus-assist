@@ -8,10 +8,11 @@ import chromadb
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 
 load_dotenv()
 
-from models import AskRequest, AskResponse, IngestStatus
+from models import AskRequest, AskResponse, AnalyseRequest, GenerateReplyRequest, GenerateReplyResponse, IngestStatus
 from rag_chain import RagChain
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(name)s  %(message)s")
@@ -153,6 +154,76 @@ def products():
         return {"products": sorted(seen)}
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"ChromaDB unavailable: {exc}")
+
+
+@app.post("/ask/stream")
+def ask_stream(req: AskRequest):
+    """Streaming version of /ask — yields SSE stage events then the final result."""
+    chain = _require_chain()
+
+    def generate():
+        yield from chain.ask_streaming(
+            question=req.question.strip(),
+            product=req.product,
+            language=req.language,
+        )
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control":    "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.post("/analyse")
+def analyse(req: AnalyseRequest):
+    if not req.text.strip():
+        raise HTTPException(status_code=422, detail="Text cannot be empty")
+    if len(req.text) > 5000:
+        raise HTTPException(status_code=422, detail="Text too long — maximum 5000 characters")
+    chain = _require_chain()
+    return chain.analyse(
+        text=req.text,
+        product=req.product,
+        language=req.language,
+        max_questions=req.max_questions,
+    )
+
+
+@app.post("/generate_reply", response_model=GenerateReplyResponse)
+def generate_reply(req: GenerateReplyRequest):
+    if not req.answered_results:
+        raise HTTPException(status_code=422, detail="No answered results provided")
+    chain = _require_chain()
+    reply = chain.generate_reply(
+        original_text=req.original_text,
+        answered_results=req.answered_results,
+        language=req.language,
+    )
+    return GenerateReplyResponse(
+        reply=reply,
+        questions_included=len(req.answered_results),
+        questions_excluded=0,
+        excluded_questions=[],
+    )
+
+
+@app.get("/stats")
+def stats():
+    """Return total chunk count in ChromaDB."""
+    try:
+        client = _chroma_client()
+        collection = client.get_collection(os.environ.get("CHROMA_COLLECTION", "airplus_assist"))
+        count = collection.count()
+        return {
+            "total_chunks": count,
+            "collection": os.environ.get("CHROMA_COLLECTION", "airplus_assist"),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"ChromaDB error: {str(e)}")
 
 
 @app.post("/ingest", response_model=IngestStatus)

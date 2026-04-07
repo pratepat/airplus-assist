@@ -48,3 +48,51 @@ class AskResponse(BaseModel):
 class IngestStatus(BaseModel):
     status: str
     message: str
+
+
+class AnalyseRequest(BaseModel):
+    text: str
+    language: str = "EN"
+    product: Optional[str] = None
+    max_questions: int = 5
+
+    @field_validator("language")
+    @classmethod
+    def validate_language(cls, v: str) -> str:
+        code = v.upper()
+        if code not in SUPPORTED_LANGUAGES:
+            raise ValueError(f"language must be one of {SUPPORTED_LANGUAGES}")
+        return code
+
+
+class QuestionResult(BaseModel):
+    question_number: int
+    extracted_question: str
+    current_question: str
+    answer: str
+    confidence: str
+    sources: list
+    has_contradiction: bool
+    product_scope: str
+    answered: bool
+
+
+class AnalyseResponse(BaseModel):
+    questions_found: int
+    original_text_length: int
+    language: str
+    results: List[QuestionResult]
+    processing_time_seconds: float
+
+
+class GenerateReplyRequest(BaseModel):
+    original_text: str
+    answered_results: list
+    language: str = "EN"
+
+
+class GenerateReplyResponse(BaseModel):
+    reply: str
+    questions_included: int
+    questions_excluded: int
+    excluded_questions: List[str]
