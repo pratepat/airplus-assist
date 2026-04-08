@@ -55,7 +55,6 @@ docs/**/**.xlsx
 docs/**/**.txt
 # But keep the folder structure and urls.txt template
 !docs/**/.gitkeep
-!docs/**/urls.txt
 
 # Logs
 *.log
