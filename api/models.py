@@ -96,3 +96,15 @@ class GenerateReplyResponse(BaseModel):
     questions_included: int
     questions_excluded: int
     excluded_questions: List[str]
+
+
+class SummaryRequest(BaseModel):
+    question: str
+    product: Optional[str] = None
+    language: str = "EN"
+
+
+class SummaryResponse(BaseModel):
+    summary: str
+    sources: list
+    sources_count: int

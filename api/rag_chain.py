@@ -627,6 +627,235 @@ class RagChain:
             "processing_time_seconds": round(time.time() - start, 1),
         }
 
+    def generate_summary(
+        self,
+        question: str,
+        product: Optional[str],
+        language: str = "EN",
+    ) -> dict:
+        """
+        Wider retrieval (15 candidates, top 10 re-ranked) synthesised into
+        a comprehensive 300-word summary. Returns summary text + sources used.
+        """
+        top_k_retrieval = int(os.getenv("SUMMARY_TOP_K_RETRIEVAL", 15))
+        top_k_rerank    = int(os.getenv("SUMMARY_TOP_K_RERANK", 10))
+
+        retrieved_with = question
+        if language != "EN":
+            retrieved_with = self._translate_to_english(question)
+
+        q_vec = self._embed.encode([retrieved_with], convert_to_numpy=True)[0].tolist()
+
+        query_kwargs: dict = dict(
+            query_embeddings=[q_vec],
+            n_results=top_k_retrieval,
+            include=["documents", "metadatas", "distances"],
+        )
+        if product:
+            query_kwargs["where"] = {"product": {"$eq": product}}
+
+        try:
+            results = self._collection().query(**query_kwargs)
+        except Exception as exc:
+            log.error("ChromaDB summary query failed: %s", exc)
+            return {"summary": "No relevant information found.", "sources": [], "sources_count": 0}
+
+        docs   = results["documents"][0]
+        metas  = results["metadatas"][0]
+
+        if not docs:
+            return {
+                "summary": "No relevant information found in the knowledge base for this topic.",
+                "sources": [], "sources_count": 0,
+            }
+
+        pairs         = [(retrieved_with, doc) for doc in docs]
+        rerank_scores = self._rerank.predict(pairs).tolist()
+
+        ranked = sorted(
+            zip(rerank_scores, docs, metas),
+            key=lambda x: x[0], reverse=True,
+        )
+
+        if ranked[0][0] < self.rerank_threshold:
+            return {
+                "summary": "No relevant information found in the knowledge base for this topic.",
+                "sources": [], "sources_count": 0,
+            }
+
+        top_chunks = ranked[:top_k_rerank]
+        lang_name  = LANG_NAMES.get(language, language)
+
+        context = ""
+        for i, (score, doc, meta) in enumerate(top_chunks, 1):
+            context += f"[Source {i}: {_build_label(meta)}]\n{doc}\n\n---\n\n"
+
+        prompt = (
+            f"You are AirPlus Assist. Write a comprehensive summary about the topic below "
+            f"using ONLY the provided sources.\n\n"
+            f"Rules:\n"
+            f"- Write approximately 300 words maximum\n"
+            f"- Cover ALL relevant aspects mentioned across the sources — be thorough\n"
+            f"- Use clear paragraphs, not bullet points\n"
+            f"- If sources contain conflicting information, flag it: "
+            f"\"Note: Sources differ on this point\"\n"
+            f"- Do not use prior knowledge — only the sources\n"
+            f"- Do not start with \"Based on the sources\" or similar phrases\n"
+            f"- Write in {lang_name} language\n"
+            f"- End with a brief concluding sentence\n\n"
+            f"Context:\n{context}\n\n"
+            f"Topic: {question}\n\n"
+            f"Comprehensive summary:"
+        )
+
+        summary_text = self._ollama_raw(prompt, max_tokens=600, timeout=120.0)
+
+        sources = []
+        for i, (score, doc, meta) in enumerate(top_chunks, 1):
+            confidence = "high" if score >= 3.0 else "medium" if score >= 0.0 else "low"
+            sources.append({
+                "rank":          i,
+                "label":         _build_label(meta),
+                "excerpt":       doc[:200],
+                "confidence":    confidence,
+                "source_type":   meta.get("source_type", ""),
+                "product":       meta.get("product", ""),
+                "url":           _none_if_empty(meta.get("url")),
+                "page_number":   meta.get("page_number") if meta.get("page_number") != "" else None,
+                "sheet_name":    _none_if_empty(meta.get("sheet_name")),
+                "question_text": _none_if_empty(meta.get("question_text")),
+                "ingested_at":   meta.get("ingested_at", ""),
+            })
+
+        return {"summary": summary_text, "sources": sources, "sources_count": len(sources)}
+
+    def generate_summary_streaming(
+        self,
+        question: str,
+        product: Optional[str],
+        language: str = "EN",
+    ):
+        """
+        Generator yielding SSE stage events then the final summary result.
+        Same protocol as ask_streaming().
+        """
+        def event(data: dict) -> str:
+            return f"data: {json.dumps(data)}\n\n"
+
+        top_k_retrieval = int(os.getenv("SUMMARY_TOP_K_RETRIEVAL", 15))
+        top_k_rerank    = int(os.getenv("SUMMARY_TOP_K_RERANK", 10))
+
+        try:
+            yield event({"stage": "searching", "message": "Retrieving comprehensive sources...", "icon": "🔍"})
+
+            retrieved_with = question
+            if language != "EN":
+                yield event({"stage": "translating", "message": "Translating question...", "icon": "🌐"})
+                retrieved_with = self._translate_to_english(question)
+
+            q_vec = self._embed.encode([retrieved_with], convert_to_numpy=True)[0].tolist()
+
+            query_kwargs: dict = dict(
+                query_embeddings=[q_vec],
+                n_results=top_k_retrieval,
+                include=["documents", "metadatas", "distances"],
+            )
+            if product:
+                query_kwargs["where"] = {"product": {"$eq": product}}
+
+            try:
+                results = self._collection().query(**query_kwargs)
+            except Exception as exc:
+                yield event({"stage": "error", "message": f"Database query failed: {exc}"})
+                return
+
+            docs  = results["documents"][0]
+            metas = results["metadatas"][0]
+
+            if not docs:
+                yield event({"stage": "complete", "result": {
+                    "summary": "No relevant information found.", "sources": [], "sources_count": 0,
+                }})
+                return
+
+            yield event({
+                "stage":   "retrieved",
+                "message": f"Found {len(docs)} sources. Re-ranking for depth...",
+                "icon":    "📚",
+            })
+
+            pairs         = [(retrieved_with, doc) for doc in docs]
+            rerank_scores = self._rerank.predict(pairs).tolist()
+
+            ranked = sorted(
+                zip(rerank_scores, docs, metas),
+                key=lambda x: x[0], reverse=True,
+            )
+
+            if ranked[0][0] < self.rerank_threshold:
+                yield event({"stage": "complete", "result": {
+                    "summary": "No relevant information found in the knowledge base for this topic.",
+                    "sources": [], "sources_count": 0,
+                }})
+                return
+
+            top_chunks    = ranked[:top_k_rerank]
+            model_display = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
+
+            yield event({
+                "stage":   "generating",
+                "message": f"Generating complete summary with {model_display}...",
+                "icon":    "🤖",
+            })
+
+            lang_name = LANG_NAMES.get(language, language)
+            context   = ""
+            for i, (score, doc, meta) in enumerate(top_chunks, 1):
+                context += f"[Source {i}: {_build_label(meta)}]\n{doc}\n\n---\n\n"
+
+            prompt = (
+                f"You are AirPlus Assist. Write a comprehensive summary about the topic below "
+                f"using ONLY the provided sources.\n\n"
+                f"Rules:\n"
+                f"- Write approximately 300 words maximum\n"
+                f"- Cover ALL relevant aspects mentioned across the sources\n"
+                f"- Use clear paragraphs, not bullet points\n"
+                f"- Flag conflicting information if found\n"
+                f"- Do not use prior knowledge\n"
+                f"- Write in {lang_name} language\n"
+                f"- End with a brief concluding sentence\n\n"
+                f"Context:\n{context}\n\n"
+                f"Topic: {question}\n\n"
+                f"Comprehensive summary:"
+            )
+
+            summary_text = self._ollama_raw(prompt, max_tokens=600, timeout=120.0)
+
+            sources = []
+            for i, (score, doc, meta) in enumerate(top_chunks, 1):
+                confidence = "high" if score >= 3.0 else "medium" if score >= 0.0 else "low"
+                sources.append({
+                    "rank":          i,
+                    "label":         _build_label(meta),
+                    "excerpt":       doc[:200],
+                    "confidence":    confidence,
+                    "source_type":   meta.get("source_type", ""),
+                    "product":       meta.get("product", ""),
+                    "url":           _none_if_empty(meta.get("url")),
+                    "page_number":   meta.get("page_number") if meta.get("page_number") != "" else None,
+                    "sheet_name":    _none_if_empty(meta.get("sheet_name")),
+                    "question_text": _none_if_empty(meta.get("question_text")),
+                    "ingested_at":   meta.get("ingested_at", ""),
+                })
+
+            yield event({"stage": "complete", "result": {
+                "summary": summary_text, "sources": sources, "sources_count": len(sources),
+            }})
+
+        except Exception as exc:
+            log.error("generate_summary_streaming failed: %s", exc)
+            yield event({"stage": "error", "message": f"Summary generation failed: {str(exc)}"})
+
     def _generate_answer(
         self,
         question: str,

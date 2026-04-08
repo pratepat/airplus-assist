@@ -254,28 +254,7 @@ section[data-testid="stSidebar"] > div {
     gap: 0 !important;
 }
 
-/* Mode selector radio buttons */
-div[data-testid="stRadio"] > div {
-    gap: 4px;
-}
-div[data-testid="stRadio"] label {
-    background: transparent;
-    padding: 6px 12px;
-    border-radius: 6px;
-    font-size: 14px;
-    font-weight: 500;
-    color: #1A1A2E;
-    cursor: pointer;
-    transition: background 0.15s;
-}
-div[data-testid="stRadio"] label:hover {
-    background: #E8F5E9;
-}
-div[data-testid="stRadio"] label[data-checked="true"] {
-    background: #E8F5E9;
-    color: #00B050;
-    font-weight: 600;
-}
+
 </style>
 """, unsafe_allow_html=True)
 
@@ -309,6 +288,8 @@ if "analyse_text" not in st.session_state:
     st.session_state.analyse_text = ""
 if "generated_reply" not in st.session_state:
     st.session_state.generated_reply = None
+if "summaries" not in st.session_state:
+    st.session_state.summaries = {}  # key: message index, value: summary dict | "loading" | None
 
 # ── Very early: convert retry → process (must run before sidebar renders) ─────
 # Setting product_select HERE means the selectbox reads the correct value
@@ -418,6 +399,24 @@ def call_ask_streaming(question: str, language: str, product: Optional[str]):
         yield {"stage": "error", "message": "The response timed out. Please try again."}
     except Exception:
         yield {"stage": "error", "message": "Cannot reach AirPlus Assist API. Is Docker running?"}
+
+
+def call_summary_streaming(question: str, language: str, product: Optional[str]):
+    """Generator that yields parsed SSE event dicts from /summary/stream."""
+    import json as _json
+    url     = f"{API_HOST}/summary/stream"
+    payload = {"question": question, "language": language, "product": product}
+    try:
+        with requests.post(url, json=payload, stream=True, timeout=180) as resp:
+            for line in resp.iter_lines():
+                if line:
+                    line_str = line.decode("utf-8") if isinstance(line, bytes) else line
+                    if line_str.startswith("data: "):
+                        yield _json.loads(line_str[6:])
+    except requests.exceptions.Timeout:
+        yield {"stage": "error", "message": "Summary generation timed out. Please try again."}
+    except Exception:
+        yield {"stage": "error", "message": "Cannot reach AirPlus Assist API for summary."}
 
 
 def call_products() -> list:
@@ -610,7 +609,11 @@ def render_source_card(source: dict) -> None:
 """, unsafe_allow_html=True)
 
 
-def render_assistant_message(msg: dict) -> None:
+def render_assistant_message(
+    msg: dict,
+    msg_index: int = None,
+    show_summary_button: bool = False,
+) -> None:
     """Render a stored assistant message dict into the current chat context."""
     confidence        = msg.get("confidence", "none")
     answer            = msg.get("answer", "")
@@ -662,6 +665,123 @@ def render_assistant_message(msg: dict) -> None:
                 unsafe_allow_html=True,
             )
         return
+
+    # ── Summary feature (Chat mode only) ─────────────────────────────────────
+    if show_summary_button and msg_index is not None:
+        cached = st.session_state.summaries.get(msg_index)
+
+        if cached is None:
+            if st.button(
+                "📋 Generate Complete Summary",
+                key=f"summary_btn_{msg_index}",
+                type="secondary",
+            ):
+                st.session_state.summaries[msg_index] = "loading"
+                st.rerun()
+
+        elif cached == "loading":
+            summary_placeholder = st.empty()
+            summary_stage_log   = []
+            sum_start           = time.time()
+            final_summary       = None
+
+            sum_question = msg.get("last_question", "")
+            sum_language = msg.get("language", "EN")
+            sum_product  = msg.get("product_scope")
+            if sum_product == "all":
+                sum_product = None
+
+            for evt in call_summary_streaming(sum_question, sum_language, sum_product):
+                stage   = evt.get("stage")
+                elapsed = time.time() - sum_start
+
+                if stage == "complete":
+                    final_summary = evt.get("result")
+                    break
+                elif stage == "error":
+                    summary_placeholder.error(evt.get("message"))
+                    st.session_state.summaries[msg_index] = None
+                    break
+                else:
+                    icon    = evt.get("icon", "⏳")
+                    message = evt.get("message", "")
+                    summary_stage_log.append((icon, message))
+
+                    rows = ""
+                    for j, (ico, msg_txt) in enumerate(summary_stage_log):
+                        is_current = (j == len(summary_stage_log) - 1)
+                        color  = "#1A1A2E" if is_current else "#9CA3AF"
+                        weight = "600"     if is_current else "400"
+                        spinner_html = (
+                            '<span style="display:inline-block;'
+                            'animation:spin 1s linear infinite;">⟳</span> '
+                            if is_current else "✓ "
+                        )
+                        rows += (
+                            f'<div style="font-size:13px;color:{color};'
+                            f'font-weight:{weight};margin:4px 0;">'
+                            f'{spinner_html}{ico} {msg_txt}</div>'
+                        )
+
+                    summary_placeholder.markdown(f"""
+<div style="background:#F0F4FF;border:1px solid #BFDBFE;
+            border-radius:10px;padding:14px 18px;">
+  {rows}
+  <div style="font-size:11px;color:#9CA3AF;margin-top:10px;
+              border-top:1px solid #E5E7EB;padding-top:8px;">
+    ⏱ {elapsed:.0f}s · Comprehensive summary
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+            summary_placeholder.empty()
+            if final_summary:
+                st.session_state.summaries[msg_index] = final_summary
+                st.rerun()
+
+        else:
+            # Summary cached — render expander
+            summary_data    = cached
+            summary_text    = summary_data.get("summary", "")
+            summary_sources = summary_data.get("sources", [])
+            sources_count   = summary_data.get("sources_count", 0)
+
+            with st.expander(f"📋 Complete Summary  ({sources_count} sources)", expanded=True):
+                st.markdown(f"""
+<div style="background:#EEF2FF;border:1px solid #C7D2FE;border-radius:8px;
+            padding:10px 14px;margin-bottom:12px;font-size:12px;color:#4338CA;">
+  📖 <b>Complete Summary</b> — synthesised from {sources_count} sources ·
+  wider retrieval than answer
+</div>
+""", unsafe_allow_html=True)
+
+                st.markdown(summary_text)
+
+                if summary_sources:
+                    st.markdown("""
+<div style="font-size:12px;font-weight:600;color:#6B7280;
+            letter-spacing:0.5px;margin:16px 0 8px 0;">
+  SUMMARY SOURCES
+</div>
+""", unsafe_allow_html=True)
+                    primary_sum = summary_sources[:2]
+                    further_sum = summary_sources[2:]
+                    for src in primary_sum:
+                        render_source_card(src)
+                    if further_sum:
+                        with st.expander(f"📖 {len(further_sum)} more source(s)", expanded=False):
+                            for src in further_sum:
+                                render_source_card(src)
+
+                _, regen_col = st.columns([3, 1])
+                with regen_col:
+                    if st.button(
+                        "🔄 Regenerate",
+                        key=f"regen_summary_{msg_index}",
+                        type="secondary",
+                    ):
+                        st.session_state.summaries[msg_index] = "loading"
+                        st.rerun()
 
     if not sources:
         if response_time is not None:
@@ -865,7 +985,8 @@ with st.sidebar:
         use_container_width=True,
         type="secondary",
     ):
-        st.session_state.messages = []
+        st.session_state.messages  = []
+        st.session_state.summaries = {}
         st.rerun()
 
     st.markdown('<hr style="border:none;border-top:1px solid #E5E7EB;margin:8px 0;">', unsafe_allow_html=True)
@@ -1022,7 +1143,7 @@ if mode == "💬 Chat":
                 if msg.get("is_meta"):
                     render_meta_answer(msg)
                 else:
-                    render_assistant_message(msg)
+                    render_assistant_message(msg, msg_index=i, show_summary_button=True)
 
     # ── Chat input — must be last widget call so Streamlit anchors it to bottom ──
 
@@ -1129,16 +1250,31 @@ if mode == "💬 Chat":
                 st.session_state.processing = False
 
                 if final_response is not None:
-                    elapsed_total = time.time() - start_time
-                    render_assistant_message({**final_response, "response_time": elapsed_total})
+                    elapsed_total   = time.time() - start_time
+                    next_msg_index  = len(st.session_state.messages)
+                    _lang_used      = final_response.get("language", selected_lang)
+                    _scope_used     = final_response.get("product_scope", "all")
+                    render_assistant_message(
+                        {
+                            **final_response,
+                            "response_time": elapsed_total,
+                            "last_question": question_to_process,
+                            "language":      _lang_used,
+                            "product_scope": _scope_used,
+                        },
+                        msg_index=next_msg_index,
+                        show_summary_button=(
+                            final_response.get("confidence") != "none"
+                        ),
+                    )
                     st.session_state.messages.append({
                         "role":             "assistant",
                         "confidence":       final_response.get("confidence", "none"),
                         "answer":           final_response.get("answer", ""),
                         "sources":          final_response.get("sources", []),
                         "has_contradiction": final_response.get("has_contradiction", False),
-                        "product_scope":    final_response.get("product_scope", "all"),
-                        "language":         final_response.get("language", "EN"),
+                        "product_scope":    _scope_used,
+                        "language":         _lang_used,
                         "response_time":    elapsed_total,
                         "last_question":    question_to_process,
                     })

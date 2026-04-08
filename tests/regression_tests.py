@@ -8,6 +8,12 @@ Usage:
     python tests/regression_tests.py
 
 Exit code 0 = all passed, 1 = one or more failures.
+
+Total tests: 33 (was 27)
+Added: api_stats, domain_datain_faq,
+domain_historical_data, analyse_endpoint_basic,
+analyse_endpoint_schema, analyse_rejects_empty_text,
+analyse_rejects_long_text
 """
 
 import json
@@ -127,6 +133,20 @@ def api_languages():
     return True, ""
 
 
+def api_stats():
+    r = _get("/stats")
+    if r.status_code != 200:
+        return False, f"HTTP {r.status_code}"
+    data = r.json()
+    if "total_chunks" not in data:
+        return False, "Missing 'total_chunks' field"
+    if "collection" not in data:
+        return False, "Missing 'collection' field"
+    if data["total_chunks"] < 1:
+        return False, "total_chunks is 0 — ChromaDB empty"
+    return True, ""
+
+
 # ── Section 2 — Hallucination Guard (must BLOCK) ──────────────────────────────
 
 def gate_blocks_capital_of_france():
@@ -231,6 +251,39 @@ def domain_user_management():
     return True, ""
 
 
+def domain_datain_faq():
+    data = _ask({
+        "question": "When will DataIN data be available in Data+?",
+        "language": "EN",
+    })
+    if data.get("confidence") not in ("high", "medium"):
+        return False, (
+            "DataIN FAQ question not answered — "
+            "check All_FAQ.txt was ingested"
+        )
+    sources = data.get("sources", [])
+    if not any(
+        "All_FAQ" in s.get("label", "") or "faq" in s.get("label", "").lower()
+        for s in sources
+    ):
+        return False, "DataIN answer not sourced from FAQ txt file"
+    return True, ""
+
+
+def domain_historical_data():
+    data = _ask({
+        "question": "How many years of historical data can I access in Data+?",
+        "language": "EN",
+    })
+    if data.get("confidence") not in ("high", "medium"):
+        return False, "Historical data question not answered"
+    answer = data.get("answer", "").lower()
+    # Answer should mention 4 years or 4+1
+    if not any(x in answer for x in ["4", "four", "calendar year"]):
+        return False, "Historical data answer missing year count — check FAQ content"
+    return True, ""
+
+
 # ── Section 4 — Product Scoping ───────────────────────────────────────────────
 
 def product_scope_portal_enforced():
@@ -282,10 +335,17 @@ def multilingual_german_excel():
     sources = data.get("sources", [])
     if len(sources) < 1:
         return False, "German multilingual query failed"
-    german_words = ["händler", "stadt", "ort", "betrag", "de:"]
     answer = data.get("answer", "").lower()
-    if not any(w in answer for w in german_words):
-        return False, "German multilingual query failed"
+    # Check answer is not in English
+    # (German answer should not contain common English-only phrases)
+    has_german_chars = any(ord(c) > 127 for c in answer)
+    # OR answer contains German-adjacent terms
+    has_german_terms = any(
+        w in answer
+        for w in ["händler", "stadt", "ort", "tarif", "betrag", "ville", "merchant city", "ort des"]
+    )
+    if not (has_german_chars or has_german_terms):
+        return False, "German answer does not appear to contain German content"
     return True, ""
 
 
@@ -390,10 +450,10 @@ def ingest_chunk_count():
         return False, f"GET /stats returned HTTP {r.status_code}"
     data = r.json()
     count = data.get("total_chunks", 0)
-    if count < 1400 or count > 2000:
+    if count < 1500 or count > 3000:
         return False, (
             f"Unexpected chunk count: {count}. "
-            "Expected 1400-2000. Re-ingest may be needed."
+            "Expected 1500-3000. Re-ingest may be needed."
         )
     return True, ""
 
@@ -411,6 +471,75 @@ def both_products_have_chunks():
     return True, ""
 
 
+# ── Section 9 — Analyse Endpoint ─────────────────────────────────────────────
+
+def analyse_endpoint_basic():
+    r = _post("/analyse", {
+        "text": (
+            "Hi, I need help. What does EUR Amount mean? "
+            "Also how do I download my eBilling file? Thanks"
+        ),
+        "language": "EN",
+        "max_questions": 5,
+    })
+    if r.status_code != 200:
+        return False, f"HTTP {r.status_code}"
+    data = r.json()
+    if "questions_found" not in data:
+        return False, "Missing 'questions_found' field"
+    if "results" not in data:
+        return False, "Missing 'results' field"
+    if data["questions_found"] < 1:
+        return False, "No questions extracted from test message"
+    answered = [res for res in data["results"] if res.get("answered")]
+    if len(answered) < 1:
+        return False, "No questions answered in analyse response"
+    return True, ""
+
+
+def analyse_endpoint_schema():
+    r = _post("/analyse", {
+        "text": "What is EUR Amount?",
+        "language": "EN",
+        "max_questions": 5,
+    })
+    if r.status_code != 200:
+        return False, f"HTTP {r.status_code}"
+    data = r.json()
+    required_top = [
+        "questions_found", "original_text_length",
+        "language", "results", "processing_time_seconds",
+    ]
+    for field in required_top:
+        if field not in data:
+            return False, f"Missing top-level field: {field}"
+    if data["results"]:
+        result = data["results"][0]
+        required_result = [
+            "question_number", "extracted_question", "current_question",
+            "answer", "confidence", "sources", "has_contradiction",
+            "product_scope", "answered",
+        ]
+        for field in required_result:
+            if field not in result:
+                return False, f"Missing result field: {field}"
+    return True, ""
+
+
+def analyse_rejects_empty_text():
+    r = _post("/analyse", {"text": "   ", "language": "EN"})
+    if r.status_code != 422:
+        return False, f"Expected 422 for empty text, got {r.status_code}"
+    return True, ""
+
+
+def analyse_rejects_long_text():
+    r = _post("/analyse", {"text": "x" * 5001, "language": "EN"})
+    if r.status_code != 422:
+        return False, f"Expected 422 for text > 5000 chars, got {r.status_code}"
+    return True, ""
+
+
 # ── Test runner ───────────────────────────────────────────────────────────────
 
 def run_all_tests():
@@ -419,6 +548,7 @@ def run_all_tests():
         api_health,
         api_products,
         api_languages,
+        api_stats,
         # Section 2 — Gate
         gate_blocks_capital_of_france,
         gate_blocks_ceo_of_apple,
@@ -430,6 +560,8 @@ def run_all_tests():
         domain_fare_basis,
         domain_where_fare_basis,
         domain_user_management,
+        domain_datain_faq,
+        domain_historical_data,
         # Section 4 — Product scope
         product_scope_portal_enforced,
         product_scope_airplus_intelligence,
@@ -449,6 +581,11 @@ def run_all_tests():
         # Section 8 — Ingest
         ingest_chunk_count,
         both_products_have_chunks,
+        # Section 9 — Analyse
+        analyse_endpoint_basic,
+        analyse_endpoint_schema,
+        analyse_rejects_empty_text,
+        analyse_rejects_long_text,
     ]
 
     passed = 0

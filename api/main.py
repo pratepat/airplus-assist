@@ -12,7 +12,7 @@ from fastapi.responses import StreamingResponse
 
 load_dotenv()
 
-from models import AskRequest, AskResponse, AnalyseRequest, GenerateReplyRequest, GenerateReplyResponse, IngestStatus
+from models import AskRequest, AskResponse, AnalyseRequest, GenerateReplyRequest, GenerateReplyResponse, IngestStatus, SummaryRequest, SummaryResponse
 from rag_chain import RagChain
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(name)s  %(message)s")
@@ -208,6 +208,43 @@ def generate_reply(req: GenerateReplyRequest):
         questions_included=len(req.answered_results),
         questions_excluded=0,
         excluded_questions=[],
+    )
+
+
+@app.post("/summary", response_model=SummaryResponse)
+def summary(req: SummaryRequest):
+    if not req.question or not req.question.strip():
+        raise HTTPException(status_code=422, detail="question must not be empty")
+    chain = _require_chain()
+    result = chain.generate_summary(
+        question=req.question.strip(),
+        product=req.product,
+        language=req.language,
+    )
+    return SummaryResponse(**result)
+
+
+@app.post("/summary/stream")
+def summary_stream(req: SummaryRequest):
+    """Streaming version of /summary — yields SSE stage events then the final result."""
+    if not req.question or not req.question.strip():
+        raise HTTPException(status_code=422, detail="question must not be empty")
+    chain = _require_chain()
+
+    def generate():
+        yield from chain.generate_summary_streaming(
+            question=req.question.strip(),
+            product=req.product,
+            language=req.language,
+        )
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control":     "no-cache",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 
