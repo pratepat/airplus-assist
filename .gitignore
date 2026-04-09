@@ -48,6 +48,9 @@ Icon
 volumes/
 chroma_data/
 
+# neo-app ingest cache
+neo-app/.cache/
+
 # Documents - never commit real business documents
 docs/**/**.pdf
 docs/**/**.docx
