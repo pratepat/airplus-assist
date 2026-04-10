@@ -968,7 +968,7 @@ class RagChain:
         httpx.TimeoutException instead of a user-facing string —
         used by translation retries so they can attempt a fallback.
         """
-        url     = f"{self.ollama_base_url}/api/generate"
+        url     = f"{os.getenv('OLLAMA_BASE_URL', 'http://ollama:11434')}/api/generate"
         payload = {
             "model":  self.ollama_model,
             "prompt": prompt,
