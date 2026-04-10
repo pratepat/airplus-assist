@@ -93,6 +93,42 @@ persists across restarts.
 
 ---
 
+## Step 5b — Mac users: enable GPU acceleration (recommended)
+
+Native Ollama on Mac uses the Apple Metal GPU, 
+giving 5-10x faster responses than Docker Ollama.
+
+In one terminal, start native Ollama:
+```bash
+ollama serve
+```
+
+Pull the model natively:
+```bash
+ollama pull qwen2.5:7b
+```
+
+In .env, change:
+OLLAMA_BASE_URL=http://host.docker.internal:11434
+
+Stop the Docker Ollama container (no longer needed):
+```bash
+docker compose stop ollama
+```
+
+Restart the API:
+```bash
+docker compose restart api
+```
+
+Expected response time: 5-10 seconds (vs 45-60s without GPU)
+
+Note: Keep the "ollama serve" terminal open while using 
+AirPlus Assist. On Windows, Docker Ollama is used instead
+— GPU passthrough on Windows requires additional setup.
+
+---
+
 ## Step 6 — Ingest the knowledge base
 
 ```bash
