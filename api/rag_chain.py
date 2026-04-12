@@ -23,6 +23,11 @@ LANG_NAMES = {
 
 NO_ANSWER = "I don't have enough information in my knowledge base to answer this question."
 
+# ── Confidence thresholds ─────────────────────────────────────────────────────
+
+CONFIDENCE_HIGH_THRESHOLD   = 3.0
+CONFIDENCE_MEDIUM_THRESHOLD = 0.0
+
 # ── System prompt template ────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """You are AirPlus Assist, a precise knowledge \
@@ -137,11 +142,18 @@ class RagChain:
         self.chroma_host      = os.environ["CHROMA_HOST"]
         self.chroma_port      = int(os.environ["CHROMA_PORT"])
         self.collection_name  = os.environ["CHROMA_COLLECTION"]
-        self.ollama_base_url  = os.environ["OLLAMA_BASE_URL"]
+        self.ollama_base_url  = os.environ.get("OLLAMA_BASE_URL", "http://host.docker.internal:11434")
         self.ollama_model     = os.environ["OLLAMA_MODEL"]
         self.top_k_retrieval   = int(os.environ.get("TOP_K_RETRIEVAL", 10))
+        if self.top_k_retrieval < 10:
+            log.warning(
+                "TOP_K_RETRIEVAL=%d is below minimum of 10. "
+                "Setting to 10. See CLAUDE.md.",
+                self.top_k_retrieval,
+            )
+            self.top_k_retrieval = 10
         self.top_k_rerank      = int(os.environ.get("TOP_K_RERANK", 3))
-        self.sim_threshold     = float(os.environ.get("SIMILARITY_THRESHOLD", 0.30))
+        self.sim_threshold     = float(os.environ.get("SIMILARITY_THRESHOLD", "0.40"))
         self.rerank_threshold  = float(os.environ.get("RERANK_THRESHOLD", -0.50))
         self.num_ctx                  = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
         self.summary_num_ctx          = int(os.getenv("OLLAMA_SUMMARY_NUM_CTX", "12288"))
@@ -216,6 +228,10 @@ class RagChain:
         try:
             return _langdetect(text[:400])
         except LangDetectException:
+            log.warning(
+                "Language detection failed for chunk (len=%d), defaulting to 'en'",
+                len(text),
+            )
             return "en"
 
     def _build_language_instruction(
@@ -382,18 +398,18 @@ class RagChain:
         else:
             retrieval_question = question
 
-        # Steps 2-3 — embed and retrieve (two-stage for portal, standard otherwise)
-        if product == "portal":
+        # Steps 2-3 — embed and retrieve (two-stage for specific product, single-stage for all)
+        if product:
             q_vec = self._embed.encode(
                 [retrieval_question], convert_to_numpy=True
             )[0].tolist()
             result = self._two_stage_retrieve(q_vec, retrieval_question, product)
             if result is None:
                 log.info(
-                    "[AirPlus Assist] Q: %.60s | lang=%s | portal gate=BLOCK | confidence=none",
-                    question, language,
+                    "[AirPlus Assist] Q: %.60s | lang=%s | product=%s | gate=BLOCK | confidence=none",
+                    question, language, product,
                 )
-                return self._no_answer(product_scope, language, original_question, retrieval_question)
+                return self._no_answer(product_scope, language, original_question, retrieval_question, search_stage="stage1")
             top_chunks, search_stage_used = result
             top_rerank_score = top_chunks[0][0]
             log.info(
@@ -486,18 +502,18 @@ class RagChain:
                 retrieval_question = self._translate_to_english(question)
                 log.info("Translated question: %r → %r", question, retrieval_question)
 
-            # Embed and retrieve (two-stage for portal, standard otherwise)
+            # Embed and retrieve (two-stage for specific product, single-stage for all)
             model_display = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
 
-            if product == "portal":
+            if product:
                 q_vec = self._embed.encode(
                     [retrieval_question], convert_to_numpy=True
                 )[0].tolist()
                 result = self._two_stage_retrieve(q_vec, retrieval_question, product)
                 if result is None:
                     yield event({"stage": "complete", "result": self._no_answer(
-                        product_scope, language, original_question, retrieval_question
-                    ).dict()})
+                        product_scope, language, original_question, retrieval_question, search_stage="stage1"
+                    ).model_dump()})
                     return
                 top_chunks, search_stage_used = result
                 top_rerank_score = top_chunks[0][0]
@@ -524,7 +540,7 @@ class RagChain:
                     top_sim=0.0,
                     search_stage=search_stage_used,
                 )
-                yield event({"stage": "complete", "result": response.dict()})
+                yield event({"stage": "complete", "result": response.model_dump()})
                 return
 
             # Standard single-stage retrieval (non-portal)
@@ -532,7 +548,7 @@ class RagChain:
             if retrieved is None:
                 yield event({"stage": "complete", "result": self._no_answer(
                     product_scope, language, original_question, retrieval_question
-                ).dict()})
+                ).model_dump()})
                 return
 
             documents, metadatas, distances, top_sim = retrieved
@@ -546,7 +562,7 @@ class RagChain:
                 )
                 yield event({"stage": "complete", "result": self._no_answer(
                     product_scope, language, original_question, retrieval_question
-                ).dict()})
+                ).model_dump()})
                 return
 
             # After retrieval, before re-rank
@@ -577,7 +593,7 @@ class RagChain:
                 )
                 yield event({"stage": "complete", "result": self._no_answer(
                     product_scope, language, original_question, retrieval_question
-                ).dict()})
+                ).model_dump()})
                 return
 
             # Gate passed, calling LLM
@@ -597,7 +613,7 @@ class RagChain:
                 top_sim=top_sim,
             )
 
-            yield event({"stage": "complete", "result": response.dict()})
+            yield event({"stage": "complete", "result": response.model_dump()})
 
         except Exception as e:
             log.error("ask_streaming failed: %s", e)
@@ -691,7 +707,7 @@ class RagChain:
                 "current_question":   question,
                 "answer":             answer.answer,
                 "confidence":         answer.confidence,
-                "sources":            [s.dict() for s in answer.sources],
+                "sources":            [s.model_dump() for s in answer.sources],
                 "has_contradiction":  answer.has_contradiction,
                 "product_scope":      answer.product_scope,
                 "answered":           answer.confidence != "none",
@@ -791,7 +807,7 @@ class RagChain:
 
         sources = []
         for i, (score, doc, meta) in enumerate(top_chunks, 1):
-            confidence = "high" if score >= 3.0 else "medium" if score >= 0.0 else "low"
+            confidence = "high" if score >= CONFIDENCE_HIGH_THRESHOLD else "medium" if score >= CONFIDENCE_MEDIUM_THRESHOLD else "low"
             sources.append({
                 "rank":          i,
                 "label":         _build_label(meta),
@@ -912,7 +928,7 @@ class RagChain:
 
             sources = []
             for i, (score, doc, meta) in enumerate(top_chunks, 1):
-                confidence = "high" if score >= 3.0 else "medium" if score >= 0.0 else "low"
+                confidence = "high" if score >= CONFIDENCE_HIGH_THRESHOLD else "medium" if score >= CONFIDENCE_MEDIUM_THRESHOLD else "low"
                 sources.append({
                     "rank":          i,
                     "label":         _build_label(meta),
@@ -947,17 +963,13 @@ class RagChain:
         search_stage: str = "all",
     ) -> AskResponse:
         """Build context, call Ollama, return AskResponse. Called by ask() and ask_streaming()."""
-        confidence = "high" if top_rerank_score >= 3.0 else "medium"
+        confidence = "high" if top_rerank_score >= CONFIDENCE_HIGH_THRESHOLD else "medium"
 
         log.info(
             "[AirPlus Assist] Q: %.60s | lang=%s | top_cosine=%.3f | "
             "top_rerank=%.3f | gate=PASS | confidence=%s",
             question, language, top_sim, top_rerank_score, confidence,
         )
-
-        # Contradiction detection (conservative: 3+ distinct source files → flag)
-        unique_source_files = {meta.get("source_file", "") for _, _, meta in top_chunks}
-        has_contradiction   = len(unique_source_files) >= 3
 
         # Build ranked context string and deduplicated sources list
         lang_instruction = self._build_language_instruction(language, top_chunks)
@@ -976,9 +988,9 @@ class RagChain:
             source_label = _build_label(meta)
             context += f"[Source {rank}: {source_label}]\n{doc}\n\n---\n\n"
 
-            if score >= 3.0:
+            if score >= CONFIDENCE_HIGH_THRESHOLD:
                 chunk_confidence = "high"
-            elif score >= 0.0:
+            elif score >= CONFIDENCE_MEDIUM_THRESHOLD:
                 chunk_confidence = "medium"
             else:
                 chunk_confidence = "low"
@@ -1005,6 +1017,12 @@ class RagChain:
         full_prompt = system_prompt + f"\nQuestion: {question}"
 
         answer_text = self._ollama_raw(full_prompt, max_tokens=512)
+
+        # Contradiction detection: flag when LLM's own answer signals conflicting sources
+        has_contradiction = (
+            "sources differ" in answer_text.lower() or
+            ("note:" in answer_text.lower() and "source" in answer_text.lower())
+        )
 
         return AskResponse(
             answer            = answer_text,
@@ -1045,7 +1063,7 @@ class RagChain:
         product: str,
     ) -> Optional[tuple[list, str]]:
         """
-        Two-stage retrieval for portal product.
+        Two-stage retrieval for any specific product.
 
         Three-tier decision using two separate thresholds:
 
@@ -1145,7 +1163,7 @@ class RagChain:
         httpx.TimeoutException instead of a user-facing string —
         used by translation retries so they can attempt a fallback.
         """
-        url     = f"{os.getenv('OLLAMA_BASE_URL', 'http://ollama:11434')}/api/generate"
+        url     = f"{os.getenv('OLLAMA_BASE_URL', 'http://host.docker.internal:11434')}/api/generate"
         payload = {
             "model":  self.ollama_model,
             "prompt": prompt,

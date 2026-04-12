@@ -144,6 +144,40 @@ Question
 → structured response with citations
 ```
 
+### Two-stage retrieval
+
+Two-stage retrieval applies to **any product that 
+has a `stage_config.json` file** in its docs folder.
+It is not portal-specific.
+
+Stage 1 sources (FAQ, glossary) are queried first.
+Stage 2 (guides, manuals) is queried only when the 
+Stage 1 result is below `STAGE1_QUALITY_THRESHOLD`.
+
+**Three-tier decision logic:**
+
+| Condition | Outcome |
+|-----------|---------|
+| `stage1_top < RERANK_THRESHOLD (-0.50)` | BLOCK — neither stage passes |
+| `stage1_top >= STAGE1_QUALITY_THRESHOLD (2.0)` | CONFIDENT — return Stage 1 answer |
+| Between -0.50 and 2.0 → check Stage 2: | |
+| `stage2_top >= RERANK_THRESHOLD (-0.50)` | Use Stage 2 answer |
+| `stage2_top < RERANK_THRESHOLD (-0.50)` | BLOCK — neither stage passes |
+
+Do not hardcode `product == "portal"` in retrieval 
+logic — presence of `stage_config.json` controls 
+whether staging is active for a given product.
+
+### Threshold reference
+
+| Constant | Value | Role |
+|----------|-------|------|
+| `RERANK_THRESHOLD` | -0.50 | Hallucination gate (blocks LLM call) |
+| `STAGE1_QUALITY_THRESHOLD` | 2.0 | Stage fallback trigger |
+| `SIMILARITY_THRESHOLD` | 0.40 | Cosine pre-filter |
+| `CONFIDENCE_HIGH_THRESHOLD` | 3.0 | Named constant in rag_chain.py |
+| `CONFIDENCE_MEDIUM_THRESHOLD` | 0.0 | Named constant in rag_chain.py |
+
 ### Chunking strategy
 
 | Format | Strategy | Chunk size |
@@ -230,6 +264,74 @@ Ollama is under concurrent load.
 
 ---
 
+## Excel key aliases
+
+Keys in AirPlus Intelligence Excel files follow the 
+pattern `dataplus.attribute.info.KEY_NAME`.
+
+The `_humanise_key()` function in `excel_parser.py` 
+automatically converts these to human-readable form:
+
+```
+dataplus.attribute.info.TRIP_DURATION_IN_DAYS
+→ "Trip Duration In Days"
+```
+
+This alias is added to every Excel chunk as a second 
+line (`Also known as: …`) so that conversational 
+queries ("how long was the trip?") can match 
+technical attribute names.
+
+**Applies to all Excel files automatically** — no 
+manual action needed when adding new Excel files. If 
+a user asks using terminology not in the key name, 
+add a synonym entry to `All_FAQ.txt` instead.
+
+---
+
+## Email extractor
+
+Converts raw support email threads into Q&A pairs 
+suitable for ingestion.
+
+| Item | Detail |
+|------|--------|
+| Script | `ingest/preprocessors/email_extractor.py` |
+| Input | `docs/{product}/emails_raw.txt` (gitignored — contains PII) |
+| Output | `docs/{product}/emails_cleaned.faq.txt` (committed — reviewed) |
+
+**Run before ingesting a new email batch:**
+```bash
+python ingest/preprocessors/email_extractor.py \
+  --input  docs/airplus_intelligence/emails_raw.txt \
+  --output docs/airplus_intelligence/emails_cleaned.faq.txt
+```
+
+**Always review the output** before ingesting. The 
+LLM extraction is not perfect — remove or edit any 
+incorrect Q&A pairs before running ingest.
+
+Raw email files are gitignored (PII risk).  
+Cleaned `.faq.txt` files are committed to git.
+
+---
+
+## Portal glossary
+
+| Item | Detail |
+|------|--------|
+| File | `glossary-portal-en.docx` |
+| Parser | `ingest/parsers/glossary_docx_parser.py` |
+| Chunking | One table row = one chunk |
+| Columns | Col 0: Letter (ignored) · Col 1: Topic · Col 2: Description · Col 3: More Information |
+
+The `more_information` field is stored as-is in 
+chunk metadata and shown in UI source cards as 
+"Further reading". It is the only parser that 
+populates this metadata field.
+
+---
+
 ## Adding a new product
 
 1. Create `docs/{product_name}/` folder
@@ -312,6 +414,19 @@ Key tests to never break:
 
 ---
 
+## Knowledge base corpus
+
+**Total: 2168 chunks** across two products.
+
+| Product | Stage | Files |
+|---------|-------|-------|
+| airplus_intelligence | 1 | glossary.xlsx, attribute_information.xlsx, All_FAQ.txt, emails_cleaned.faq.txt |
+| airplus_intelligence | 2 | dataplus-quick-guide-en.pdf, urls.txt |
+| portal | 1 | glossary-portal-en.docx (135 chunks), faq-portal-en.pdf, faq-virtual-cards-hotel-en.pdf |
+| portal | 2 | All guide PDFs |
+
+---
+
 ## What NOT to do
 
 - Do not use localhost in docker-compose service 
@@ -329,6 +444,9 @@ Key tests to never break:
 - Do not commit .env or docs/ to git
 - Do not hardcode product names — derive from 
   folder names or ChromaDB metadata
+- Do not hardcode `product == "portal"` in 
+  retrieval logic — use `stage_config.json` 
+  to control two-stage retrieval per product
 
 ---
 

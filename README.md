@@ -130,6 +130,36 @@ docker compose up
 
 ---
 
+## Knowledge base corpus
+
+**Total: 2168 chunks** across two products.
+
+### AirPlus Intelligence
+
+| Stage | File | Format | Notes |
+|-------|------|--------|-------|
+| Stage 1 | glossary.xlsx | Excel | Human-readable key aliases |
+| Stage 1 | attribute_information.xlsx | Excel | Human-readable key aliases |
+| Stage 1 | All_FAQ.txt | TXT (Q&A) | Product team maintained |
+| Stage 1 | emails_cleaned.faq.txt | TXT (Q&A) | LLM-extracted from support emails |
+| Stage 2 | dataplus-quick-guide-en.pdf | PDF | |
+| Stage 2 | urls.txt | URLs | One URL per line |
+
+### Portal
+
+| Stage | File | Format | Notes |
+|-------|------|--------|-------|
+| Stage 1 | glossary-portal-en.docx | DOCX | 135 chunks, More Information field |
+| Stage 1 | faq-portal-en.pdf | PDF | |
+| Stage 1 | faq-virtual-cards-hotel-en.pdf | PDF | |
+| Stage 2 | *(all guide PDFs)* | PDF | Step-by-step process documents |
+
+Stage 1 = high-precision sources queried first.  
+Stage 2 = deep-dive documents queried when Stage 1 
+score is below `STAGE1_QUALITY_THRESHOLD=2.0`.
+
+---
+
 ## API endpoints
 
 | Method | Endpoint | Description |

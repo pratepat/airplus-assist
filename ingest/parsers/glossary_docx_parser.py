@@ -36,6 +36,7 @@ def parse_glossary_docx(
         return chunks
 
     table = doc.tables[0]
+    chunk_index = 0
 
     for i, row in enumerate(table.rows):
         # Skip header row
@@ -82,10 +83,11 @@ def parse_glossary_docx(
                 "section_title":    "Portal Glossary",
                 "chunk_preview":    chunk_preview,
                 "ingested_at":      ingested_at,
-                "chunk_index":      i,
+                "chunk_index":      chunk_index,
                 "more_information": more_info,
                 "search_stage":     "1",
             }
         })
+        chunk_index += 1
 
     return chunks

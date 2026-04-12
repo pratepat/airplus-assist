@@ -1,0 +1,9 @@
+{
+  "stage1": [
+    "glossary.xlsx",
+    "attribute_information.xlsx",
+    "All_FAQ.txt",
+    "emails_cleaned.faq.txt"
+  ],
+  "description": "Stage 1: core reference files searched first. Stage 2: all other documents."
+}

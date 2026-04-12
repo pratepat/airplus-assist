@@ -28,6 +28,15 @@ _LANG_CODES = {
 }
 
 
+def _humanise_key(key: str) -> str:
+    """
+    Convert technical key to human-readable alias.
+    dataplus.attribute.info.TRIP_DURATION_IN_DAYS → Trip Duration In Days
+    """
+    last_part = key.split(".")[-1]
+    return last_part.replace("_", " ").title()
+
+
 def _is_approved_col(name: str) -> bool:
     """Return True if the column is an approval-status flag."""
     n = str(name).strip()
@@ -109,7 +118,8 @@ def parse_excel(file_path: Path, product: str) -> list[dict]:
             if not key_val:
                 continue  # skip rows with no Key
 
-            lines = [f"Term: {key_val}"]
+            human_name = _humanise_key(key_val)
+            lines = [f"Term: {key_val}", f"Also known as: {human_name}"]
             for col_idx in content_col_indices:
                 if col_idx >= len(row):
                     continue
@@ -120,9 +130,6 @@ def parse_excel(file_path: Path, product: str) -> list[dict]:
 
             content = "\n".join(lines)
 
-            # Verification print for specific key
-            if key_val == "dataplus.attribute.FLIGHT_COUPON_FARE_BASIS_CODE":
-                print(f"\n[VERIFY] {file_path.name} / {sheet_name}:\n{content}\n")
             results.append({
                 "content": content,
                 "metadata": {

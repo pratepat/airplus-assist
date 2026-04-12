@@ -53,6 +53,8 @@ docs/**/**.pdf
 docs/**/**.docx
 docs/**/**.xlsx
 docs/**/**.txt
+docs/**/**.eml
+docs/**/**.msg
 # But keep the folder structure and urls.txt template
 !docs/**/.gitkeep
 

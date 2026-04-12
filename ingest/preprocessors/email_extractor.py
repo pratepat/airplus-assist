@@ -1,0 +1,290 @@
+"""
+AirPlus Assist — Email Q&A Extractor
+=====================================
+Reads a raw customer support email file, sends it
+to the local Ollama LLM in chunks, extracts clean
+anonymised Q&A pairs, and saves as .faq.txt format
+compatible with the existing FAQ text parser.
+
+Usage:
+    python ingest/preprocessors/email_extractor.py \
+        --input docs/airplus_intelligence/emails_raw.txt \
+        --output docs/airplus_intelligence/emails_cleaned.faq.txt
+
+The output file is ingested by build_vectorstore.py
+automatically via the existing Q&A-aware text parser.
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+
+import httpx
+
+# ── Configuration ─────────────────────────────────
+OLLAMA_BASE_URL = os.getenv(
+    "OLLAMA_BASE_URL", "http://localhost:11434"
+)
+OLLAMA_MODEL = os.getenv(
+    "OLLAMA_MODEL", "qwen2.5:7b"
+)
+CHUNK_CHAR_LIMIT = 6000   # chars per LLM call
+TIMEOUT = 120.0
+
+
+# ── Prompt ────────────────────────────────────────
+EXTRACTION_PROMPT = """You are extracting knowledge
+from customer support email threads about AirPlus
+Intelligence Data+ reporting tool.
+
+Extract ONLY questions and answers that contain
+useful product knowledge. Output ONLY a JSON array.
+
+Rules:
+- Each item must have "q" and "a" keys
+- Questions: clear, direct, searchable
+- Answers: factual, concise, from the AirPlus
+  team's responses only (not customer questions)
+- ANONYMISE: replace all customer names, company
+  names, email addresses with generic terms
+  e.g. "the customer", "a user", "a company"
+- DEDUPLICATE: if same question appears multiple
+  times, include only once with best answer
+- SKIP: greetings, signatures, legal footers,
+  internal operational emails (ServiceNow,
+  hypercare process emails), emails without
+  clear product Q&A
+- SKIP: questions referencing screenshots only
+  ("as shown below") with no text answer
+- Language: output all Q&A in English only
+- Maximum 20 items per chunk
+- If no useful Q&A found, return empty array []
+
+Return ONLY the JSON array. No explanation.
+No markdown. No preamble.
+
+Email content:
+{content}
+
+JSON array:"""
+
+
+# ── Helpers ───────────────────────────────────────
+
+def split_into_chunks(text: str,
+                      limit: int) -> list[str]:
+    """Split text into chunks at email boundaries."""
+    boundaries = re.split(
+        r'\n(?=(?:From:|Von:|Internal\n|Dear |Hi |'
+        r'Hello ))',
+        text
+    )
+
+    chunks = []
+    current = ""
+    for part in boundaries:
+        if len(current) + len(part) > limit \
+                and current:
+            chunks.append(current.strip())
+            current = part
+        else:
+            current += "\n" + part
+    if current.strip():
+        chunks.append(current.strip())
+
+    # If any chunk still too large, split by chars
+    final_chunks = []
+    for chunk in chunks:
+        if len(chunk) > limit:
+            for i in range(0, len(chunk), limit):
+                final_chunks.append(chunk[i:i+limit])
+        else:
+            final_chunks.append(chunk)
+
+    return [c for c in final_chunks if len(c) > 100]
+
+
+def call_ollama(prompt: str) -> str:
+    """Call Ollama and return raw response text."""
+    response = httpx.post(
+        f"{OLLAMA_BASE_URL}/api/generate",
+        json={
+            "model": OLLAMA_MODEL,
+            "prompt": prompt,
+            "stream": False,
+            "options": {
+                "temperature": 0.1,
+                "num_predict": 2048,
+                "num_ctx": 8192
+            }
+        },
+        timeout=TIMEOUT
+    )
+    response.raise_for_status()
+    return response.json().get("response", "").strip()
+
+
+def parse_qa_response(raw: str) -> list[dict]:
+    """Parse JSON array from LLM response."""
+    # Strip markdown fences if present
+    raw = re.sub(
+        r'^```(?:json)?\s*', '', raw,
+        flags=re.MULTILINE
+    ).strip()
+    raw = re.sub(
+        r'\s*```$', '', raw,
+        flags=re.MULTILINE
+    ).strip()
+
+    # Find JSON array
+    match = re.search(r'\[.*\]', raw, re.DOTALL)
+    if not match:
+        return []
+
+    try:
+        items = json.loads(match.group())
+        return [
+            item for item in items
+            if isinstance(item, dict)
+            and item.get("q", "").strip()
+            and item.get("a", "").strip()
+        ]
+    except json.JSONDecodeError:
+        return []
+
+
+def deduplicate(
+    all_pairs: list[dict]
+) -> list[dict]:
+    """Remove duplicate questions."""
+    seen = set()
+    unique = []
+    for pair in all_pairs:
+        key = re.sub(
+            r'\s+', ' ',
+            pair["q"].lower().strip()
+        )[:100]
+        if key not in seen:
+            seen.add(key)
+            unique.append(pair)
+    return unique
+
+
+def format_as_faq_txt(
+    pairs: list[dict]
+) -> str:
+    """Format Q&A pairs as .faq.txt content."""
+    lines = [
+        "# AirPlus Intelligence Data+ — "
+        "Customer Email Q&A",
+        "# Auto-generated by email_extractor.py",
+        "# Review before ingesting.",
+        ""
+    ]
+    for pair in pairs:
+        q = pair["q"].strip()
+        a = pair["a"].strip()
+        q = re.sub(r'\s+', ' ', q)
+        lines.append(f"Q: {q}")
+        lines.append(f"A: {a}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+# ── Main ──────────────────────────────────────────
+
+def extract(input_path: Path,
+            output_path: Path) -> None:
+
+    if not input_path.exists():
+        print(f"Error: {input_path} not found.")
+        sys.exit(1)
+
+    print(f"Reading: {input_path}")
+    raw_text = input_path.read_text(
+        encoding="utf-8", errors="replace"
+    )
+    print(f"Total characters: {len(raw_text):,}")
+
+    chunks = split_into_chunks(
+        raw_text, CHUNK_CHAR_LIMIT)
+    print(f"Split into {len(chunks)} chunks")
+
+    all_pairs: list[dict] = []
+
+    for i, chunk in enumerate(chunks, 1):
+        print(f"\nProcessing chunk {i}/{len(chunks)} "
+              f"({len(chunk):,} chars)...")
+
+        prompt = EXTRACTION_PROMPT.format(
+            content=chunk)
+
+        try:
+            raw_response = call_ollama(prompt)
+            pairs = parse_qa_response(raw_response)
+            print(f"  → Extracted {len(pairs)} Q&A pairs")
+            all_pairs.extend(pairs)
+
+            if i < len(chunks):
+                time.sleep(1)
+
+        except Exception as e:
+            print(f"  → Error on chunk {i}: {e}")
+            continue
+
+    unique_pairs = deduplicate(all_pairs)
+    print(f"\nTotal extracted: {len(all_pairs)}")
+    print(f"After deduplication: {len(unique_pairs)}")
+
+    if not unique_pairs:
+        print("Warning: No Q&A pairs extracted.")
+        print("Check that Ollama is running and "
+              "the email file has content.")
+        sys.exit(1)
+
+    output_path.parent.mkdir(
+        parents=True, exist_ok=True)
+    output_path.write_text(
+        format_as_faq_txt(unique_pairs),
+        encoding="utf-8"
+    )
+    print(f"\nSaved {len(unique_pairs)} Q&A pairs to:")
+    print(f"  {output_path}")
+    print("\nNext steps:")
+    print("  1. Review the output file")
+    print("  2. Edit or remove any incorrect Q&A pairs")
+    print("  3. Run: docker compose --profile ingest "
+          "run --rm ingest python build_vectorstore.py")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Extract Q&A from email files"
+    )
+    parser.add_argument(
+        "--input", "-i",
+        type=Path,
+        default=Path(
+            "docs/airplus_intelligence/emails_raw.txt"
+        ),
+        help="Path to raw email text file"
+    )
+    parser.add_argument(
+        "--output", "-o",
+        type=Path,
+        default=Path(
+            "docs/airplus_intelligence/"
+            "emails_cleaned.faq.txt"
+        ),
+        help="Path for cleaned FAQ output"
+    )
+    args = parser.parse_args()
+    extract(args.input, args.output)
+
+
+if __name__ == "__main__":
+    main()

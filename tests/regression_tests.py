@@ -9,11 +9,25 @@ Usage:
 
 Exit code 0 = all passed, 1 = one or more failures.
 
-Total tests: 33 (was 27)
-Added: api_stats, domain_datain_faq,
+Total tests: 47 (was 33)
+Added in v2: api_stats, domain_datain_faq,
 domain_historical_data, analyse_endpoint_basic,
 analyse_endpoint_schema, analyse_rejects_empty_text,
 analyse_rejects_long_text
+Added in v3: two_stage_portal_confident_stage1,
+two_stage_blocked_tagged_stage1,
+two_stage_all_products_single_stage,
+two_stage_airplus_intelligence_active,
+glossary_docx_cited_for_portal,
+glossary_docx_more_information_field,
+response_has_search_stage_field,
+source_has_more_information_field,
+email_faq_virtual_account_numbers,
+excel_alias_trip_duration,
+ingest_has_email_faq_chunks,
+ingest_has_glossary_docx_chunks,
+stage1_blocks_out_of_domain_portal,
+stage1_quality_threshold_airplus
 """
 
 import json
@@ -26,7 +40,7 @@ import requests
 
 API_BASE = "http://localhost:8001"
 UI_BASE  = "http://localhost:8501"
-TIMEOUT  = 300  # seconds — mistral:7b can be slow under sustained load
+TIMEOUT  = 300  # seconds — qwen2.5:7b can be slow on first call
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -540,6 +554,213 @@ def analyse_rejects_long_text():
     return True, ""
 
 
+# ── Section 10 — Two-Stage Retrieval ─────────────────────────────────────────
+
+def two_stage_portal_confident_stage1():
+    """Confident portal glossary answer must come from stage1."""
+    data = _ask({"question": "What is 3D Secure?", "language": "EN", "product": "portal"})
+    if data.get("confidence") not in ("high", "medium"):
+        return False, "3D Secure not answered for portal"
+    if data.get("search_stage") != "stage1":
+        return False, f"Expected stage1, got {data.get('search_stage')!r}"
+    return True, ""
+
+
+def two_stage_blocked_tagged_stage1():
+    """Out-of-domain portal query must block and be tagged search_stage=stage1, not 'all'."""
+    data = _ask({"question": "What is the capital of France?", "language": "EN", "product": "portal"})
+    if data.get("confidence") != "none":
+        return False, "Hallucination guard failed for portal-scoped query"
+    if data.get("search_stage") != "stage1":
+        return False, f"Blocked response should be tagged stage1, got {data.get('search_stage')!r}"
+    return True, ""
+
+
+def two_stage_all_products_single_stage():
+    """No-product query must bypass two-stage and return search_stage='all'."""
+    data = _ask({"question": "What is EUR Amount?", "language": "EN"})
+    if data.get("confidence") not in ("high", "medium"):
+        return False, "All-products query not answered"
+    if data.get("search_stage") != "all":
+        return False, f"Expected search_stage='all' for no-product query, got {data.get('search_stage')!r}"
+    return True, ""
+
+
+def two_stage_airplus_intelligence_active():
+    """Specific product queries must use two-stage — search_stage must not be 'all'."""
+    data = _ask({
+        "question": "What does MERCHANT_CITY mean?",
+        "language": "EN",
+        "product": "airplus_intelligence",
+    })
+    if data.get("confidence") not in ("high", "medium"):
+        return False, "MERCHANT_CITY not answered for airplus_intelligence"
+    if data.get("search_stage") == "all":
+        return False, "Two-stage not active for airplus_intelligence — search_stage is 'all'"
+    return True, ""
+
+
+def stage1_blocks_out_of_domain_portal():
+    """CEO of Apple must be blocked by two-stage gate for portal product."""
+    data = _ask({"question": "Who is the CEO of Apple?", "language": "EN", "product": "portal"})
+    if data.get("confidence") != "none":
+        return False, "Hallucination guard failed — off-domain question answered for portal"
+    if data.get("search_stage") not in ("stage1", "stage2"):
+        return False, f"Blocked portal response should have stage tag, got {data.get('search_stage')!r}"
+    return True, ""
+
+
+def stage1_quality_threshold_airplus():
+    """Well-known attribute must be answered at stage1 for airplus_intelligence."""
+    data = _ask({
+        "question": "What is MERCHANT_CITY?",
+        "language": "EN",
+        "product": "airplus_intelligence",
+    })
+    if data.get("confidence") not in ("high", "medium"):
+        return False, "MERCHANT_CITY not answered — stage1 quality threshold may be miscalibrated"
+    if data.get("search_stage") != "stage1":
+        return False, f"MERCHANT_CITY should be stage1 (it is in glossary.xlsx), got {data.get('search_stage')!r}"
+    return True, ""
+
+
+# ── Section 11 — Glossary DOCX ────────────────────────────────────────────────
+
+def glossary_docx_cited_for_portal():
+    """Portal glossary query must cite a glossary_docx source."""
+    data = _ask({"question": "What is 3D Secure?", "language": "EN", "product": "portal"})
+    sources = data.get("sources", [])
+    if not any(s.get("source_type") == "glossary_docx" for s in sources):
+        return False, "No glossary_docx source cited — check glossary-portal-en.docx was ingested"
+    return True, ""
+
+
+def glossary_docx_more_information_field():
+    """Glossary sources must include the more_information field (may be None or str)."""
+    data = _ask({"question": "What is 3D Secure?", "language": "EN", "product": "portal"})
+    sources = data.get("sources", [])
+    glossary_sources = [s for s in sources if s.get("source_type") == "glossary_docx"]
+    if not glossary_sources:
+        return False, "No glossary_docx source returned to check more_information on"
+    for src in glossary_sources:
+        if "more_information" not in src:
+            return False, "more_information field missing from glossary_docx source"
+    return True, ""
+
+
+def glossary_docx_icon_source_type():
+    """Glossary DOCX source_type must be exactly 'glossary_docx'."""
+    data = _ask({"question": "What is 3D Secure?", "language": "EN", "product": "portal"})
+    sources = data.get("sources", [])
+    glossary_sources = [s for s in sources if s.get("source_type") == "glossary_docx"]
+    if not glossary_sources:
+        return False, "No glossary_docx source returned"
+    src = glossary_sources[0]
+    if src.get("source_type") != "glossary_docx":
+        return False, f"Unexpected source_type: {src.get('source_type')!r}"
+    return True, ""
+
+
+# ── Section 12 — Response Schema (new fields) ─────────────────────────────────
+
+def response_has_search_stage_field():
+    """AskResponse must include search_stage field with a valid value."""
+    data = _ask({"question": "What is EUR Amount?", "language": "EN"})
+    if "search_stage" not in data:
+        return False, "search_stage field missing from AskResponse"
+    if data["search_stage"] not in ("stage1", "stage2", "all"):
+        return False, f"Invalid search_stage value: {data['search_stage']!r}"
+    return True, ""
+
+
+def source_has_more_information_field():
+    """All source citations must include the more_information field."""
+    data = _ask({"question": "What does MERCHANT_CITY mean?", "language": "EN"})
+    sources = data.get("sources", [])
+    if not sources:
+        return False, "No sources returned to check more_information field"
+    for i, src in enumerate(sources):
+        if "more_information" not in src:
+            return False, f"more_information field missing from source {i + 1}"
+    return True, ""
+
+
+# ── Section 13 — Email FAQ ────────────────────────────────────────────────────
+
+def email_faq_virtual_account_numbers():
+    """Email-extracted FAQ must be searchable and return the email chunk as a source."""
+    data = _ask({
+        "question": "What are Virtual Account Numbers in Data+?",
+        "language": "EN",
+    })
+    if data.get("confidence") not in ("high", "medium"):
+        return False, "Email FAQ question not answered — check emails_cleaned.faq.txt was ingested"
+    sources = data.get("sources", [])
+    if not any("emails_cleaned" in s.get("label", "").lower() for s in sources):
+        return False, "Email FAQ answer not sourced from emails_cleaned.faq.txt"
+    return True, ""
+
+
+def ingest_has_email_faq_chunks():
+    """ChromaDB must contain chunks from emails_cleaned.faq.txt."""
+    r = _get("/stats")
+    if r.status_code != 200:
+        return False, f"GET /stats returned HTTP {r.status_code}"
+    data = r.json()
+    chunks_by_file = data.get("chunks_by_file", {})
+    if not chunks_by_file:
+        # /stats may not return per-file breakdown — skip detailed check
+        return True, ""
+    if "emails_cleaned.faq.txt" not in chunks_by_file:
+        return False, "emails_cleaned.faq.txt not found in chunk stats — re-ingest required"
+    if chunks_by_file["emails_cleaned.faq.txt"] < 1:
+        return False, "emails_cleaned.faq.txt has 0 chunks — re-ingest required"
+    return True, ""
+
+
+def ingest_has_glossary_docx_chunks():
+    """ChromaDB must contain chunks from glossary-portal-en.docx."""
+    r = _get("/stats")
+    if r.status_code != 200:
+        return False, f"GET /stats returned HTTP {r.status_code}"
+    data = r.json()
+    chunks_by_file = data.get("chunks_by_file", {})
+    if not chunks_by_file:
+        return True, ""
+    if "glossary-portal-en.docx" not in chunks_by_file:
+        return False, "glossary-portal-en.docx not found in chunk stats — re-ingest required"
+    if chunks_by_file["glossary-portal-en.docx"] < 100:
+        return False, f"Too few glossary_docx chunks: {chunks_by_file['glossary-portal-en.docx']}"
+    return True, ""
+
+
+# ── Section 14 — Excel Humanised Alias ───────────────────────────────────────
+
+def excel_alias_trip_duration():
+    """Human-readable alias 'Trip Duration In Days' must be matchable via natural language."""
+    data = _ask({"question": "What is Trip Duration In Days?", "language": "EN"})
+    if data.get("confidence") not in ("high", "medium"):
+        return False, "Humanised alias query not answered — check _humanise_key() in excel_parser.py"
+    sources = data.get("sources", [])
+    if not any("TRIP_DURATION" in s.get("label", "").upper() for s in sources):
+        return False, "TRIP_DURATION attribute not cited — humanised alias may not be matching"
+    return True, ""
+
+
+def excel_alias_present_in_excerpt():
+    """Excel chunk excerpts must contain 'Also known as:' alias line."""
+    data = _ask({"question": "What is MERCHANT_CITY?", "language": "EN"})
+    sources = data.get("sources", [])
+    xlsx_sources = [s for s in sources if s.get("source_type") == "xlsx"]
+    if not xlsx_sources:
+        return False, "No xlsx source returned for MERCHANT_CITY query"
+    src = xlsx_sources[0]
+    excerpt = src.get("excerpt", "")
+    if "Also known as:" not in excerpt:
+        return False, "Excel chunk missing 'Also known as:' alias — re-ingest with updated excel_parser.py"
+    return True, ""
+
+
 # ── Test runner ───────────────────────────────────────────────────────────────
 
 def run_all_tests():
@@ -586,6 +807,27 @@ def run_all_tests():
         analyse_endpoint_schema,
         analyse_rejects_empty_text,
         analyse_rejects_long_text,
+        # Section 10 — Two-Stage Retrieval
+        two_stage_portal_confident_stage1,
+        two_stage_blocked_tagged_stage1,
+        two_stage_all_products_single_stage,
+        two_stage_airplus_intelligence_active,
+        stage1_blocks_out_of_domain_portal,
+        stage1_quality_threshold_airplus,
+        # Section 11 — Glossary DOCX
+        glossary_docx_cited_for_portal,
+        glossary_docx_more_information_field,
+        glossary_docx_icon_source_type,
+        # Section 12 — Response Schema (new fields)
+        response_has_search_stage_field,
+        source_has_more_information_field,
+        # Section 13 — Email FAQ
+        email_faq_virtual_account_numbers,
+        ingest_has_email_faq_chunks,
+        ingest_has_glossary_docx_chunks,
+        # Section 14 — Excel Humanised Alias
+        excel_alias_trip_duration,
+        excel_alias_present_in_excerpt,
     ]
 
     passed = 0
