@@ -99,6 +99,9 @@ def _build_label(meta: dict) -> str:
         return f"{source_file}{suffix}"
     if src_type == "url":
         return meta.get("url") or source_file
+    if src_type == "glossary_docx":
+        term = meta.get("question_text") or ""
+        return f"{source_file} — Term: {term}" if term else source_file
     if src_type == "docx":
         section = meta.get("section_title")
         return f"{source_file} — {section}" if section else source_file
@@ -140,6 +143,8 @@ class RagChain:
         self.top_k_rerank      = int(os.environ.get("TOP_K_RERANK", 3))
         self.sim_threshold     = float(os.environ.get("SIMILARITY_THRESHOLD", 0.30))
         self.rerank_threshold  = float(os.environ.get("RERANK_THRESHOLD", -0.50))
+        self.num_ctx           = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
+        self.summary_num_ctx   = int(os.getenv("OLLAMA_SUMMARY_NUM_CTX", "12288"))
 
         log.info("Similarity threshold: %s", self.sim_threshold)
 
@@ -376,7 +381,34 @@ class RagChain:
         else:
             retrieval_question = question
 
-        # Steps 2-3 — embed and retrieve
+        # Steps 2-3 — embed and retrieve (two-stage for portal, standard otherwise)
+        if product == "portal":
+            q_vec = self._embed.encode(
+                [retrieval_question], convert_to_numpy=True
+            )[0].tolist()
+            result = self._two_stage_retrieve(q_vec, retrieval_question, product)
+            if result is None:
+                return self._no_answer(product_scope, language, original_question, retrieval_question)
+            top_chunks, search_stage_used = result
+            top_rerank_score = top_chunks[0][0]
+            if top_rerank_score < self.rerank_threshold:
+                log.info(
+                    "[AirPlus Assist] Q: %.60s | lang=%s | stage=%s | "
+                    "top_rerank=%.3f | gate=BLOCK | confidence=none",
+                    question, language, search_stage_used, top_rerank_score,
+                )
+                return self._no_answer(product_scope, language, original_question, retrieval_question)
+            return self._generate_answer(
+                question=original_question,
+                retrieval_question=retrieval_question,
+                language=language,
+                product_scope=product_scope,
+                top_chunks=top_chunks,
+                top_rerank_score=top_rerank_score,
+                top_sim=0.0,
+                search_stage=search_stage_used,
+            )
+
         retrieved = self._retrieve_and_rerank(retrieval_question, product)
         if retrieved is None:
             return self._no_answer(product_scope, language, original_question, retrieval_question)
@@ -450,7 +482,59 @@ class RagChain:
                 retrieval_question = self._translate_to_english(question)
                 log.info("Translated question: %r → %r", question, retrieval_question)
 
-            # Embed and retrieve
+            # Embed and retrieve (two-stage for portal, standard otherwise)
+            model_display = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
+
+            if product == "portal":
+                q_vec = self._embed.encode(
+                    [retrieval_question], convert_to_numpy=True
+                )[0].tolist()
+                result = self._two_stage_retrieve(q_vec, retrieval_question, product)
+                if result is None:
+                    yield event({"stage": "complete", "result": self._no_answer(
+                        product_scope, language, original_question, retrieval_question
+                    ).dict()})
+                    return
+                top_chunks, search_stage_used = result
+                top_rerank_score = top_chunks[0][0]
+
+                yield event({
+                    "stage":   "retrieved",
+                    "message": f"Found {len(top_chunks)} sources ({search_stage_used}). Re-ranking complete.",
+                    "icon":    "📚",
+                })
+
+                if top_rerank_score < self.rerank_threshold:
+                    log.info(
+                        "[AirPlus Assist] Q: %.60s | lang=%s | stage=%s | "
+                        "top_rerank=%.3f | gate=BLOCK | confidence=none",
+                        question, language, search_stage_used, top_rerank_score,
+                    )
+                    yield event({"stage": "complete", "result": self._no_answer(
+                        product_scope, language, original_question, retrieval_question
+                    ).dict()})
+                    return
+
+                yield event({
+                    "stage":   "generating",
+                    "message": f"Generating answer with {model_display}...",
+                    "icon":    "🤖",
+                })
+
+                response = self._generate_answer(
+                    question=original_question,
+                    retrieval_question=retrieval_question,
+                    language=language,
+                    product_scope=product_scope,
+                    top_chunks=top_chunks,
+                    top_rerank_score=top_rerank_score,
+                    top_sim=0.0,
+                    search_stage=search_stage_used,
+                )
+                yield event({"stage": "complete", "result": response.dict()})
+                return
+
+            # Standard single-stage retrieval (non-portal)
             retrieved = self._retrieve_and_rerank(retrieval_question, product)
             if retrieved is None:
                 yield event({"stage": "complete", "result": self._no_answer(
@@ -472,7 +556,7 @@ class RagChain:
                 ).dict()})
                 return
 
-            # Stage 2 — after retrieval, before re-rank
+            # After retrieval, before re-rank
             yield event({
                 "stage":   "retrieved",
                 "message": f"Found {len(documents)} relevant sources. Re-ranking...",
@@ -503,8 +587,7 @@ class RagChain:
                 ).dict()})
                 return
 
-            # Stage 3 — gate passed, calling LLM
-            model_display = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
+            # Gate passed, calling LLM
             yield event({
                 "stage":   "generating",
                 "message": f"Generating answer with {model_display}...",
@@ -606,7 +689,9 @@ class RagChain:
 
         results = []
         for i, question in enumerate(questions, 1):
+            q_start = time.time()
             answer = self.ask(question=question, product=product, language=language)
+            q_elapsed = time.time() - q_start
             results.append({
                 "question_number":    i,
                 "extracted_question": question,
@@ -617,6 +702,7 @@ class RagChain:
                 "has_contradiction":  answer.has_contradiction,
                 "product_scope":      answer.product_scope,
                 "answered":           answer.confidence != "none",
+                "response_time":      round(q_elapsed, 1),
             })
 
         return {
@@ -708,7 +794,7 @@ class RagChain:
             f"Comprehensive summary:"
         )
 
-        summary_text = self._ollama_raw(prompt, max_tokens=600, timeout=120.0)
+        summary_text = self._ollama_raw(prompt, max_tokens=600, timeout=120.0, num_ctx=self.summary_num_ctx)
 
         sources = []
         for i, (score, doc, meta) in enumerate(top_chunks, 1):
@@ -829,7 +915,7 @@ class RagChain:
                 f"Comprehensive summary:"
             )
 
-            summary_text = self._ollama_raw(prompt, max_tokens=600, timeout=120.0)
+            summary_text = self._ollama_raw(prompt, max_tokens=600, timeout=120.0, num_ctx=self.summary_num_ctx)
 
             sources = []
             for i, (score, doc, meta) in enumerate(top_chunks, 1):
@@ -865,6 +951,7 @@ class RagChain:
         top_chunks: list,
         top_rerank_score: float,
         top_sim: float,
+        search_stage: str = "all",
     ) -> AskResponse:
         """Build context, call Ollama, return AskResponse. Called by ask() and ask_streaming()."""
         confidence = "high" if top_rerank_score >= 3.0 else "medium"
@@ -904,17 +991,18 @@ class RagChain:
                 chunk_confidence = "low"
 
             sources.append(SourceReference(
-                rank          = rank,
-                label         = source_label,
-                excerpt       = doc[:200],
-                confidence    = chunk_confidence,
-                source_type   = meta.get("source_type", ""),
-                product       = meta.get("product", ""),
-                url           = _none_if_empty(meta.get("url")),
-                page_number   = meta.get("page_number") if meta.get("page_number") != "" else None,
-                sheet_name    = _none_if_empty(meta.get("sheet_name")),
-                question_text = _none_if_empty(meta.get("question_text")),
-                ingested_at   = meta.get("ingested_at", ""),
+                rank             = rank,
+                label            = source_label,
+                excerpt          = doc[:200],
+                confidence       = chunk_confidence,
+                source_type      = meta.get("source_type", ""),
+                product          = meta.get("product", ""),
+                url              = _none_if_empty(meta.get("url")),
+                page_number      = meta.get("page_number") if meta.get("page_number") != "" else None,
+                sheet_name       = _none_if_empty(meta.get("sheet_name")),
+                question_text    = _none_if_empty(meta.get("question_text")),
+                more_information = _none_if_empty(meta.get("more_information")),
+                ingested_at      = meta.get("ingested_at", ""),
             ))
 
         system_prompt = SYSTEM_PROMPT.format(
@@ -934,6 +1022,7 @@ class RagChain:
             retrieved_with    = retrieval_question,
             sources           = sources,
             has_contradiction = has_contradiction,
+            search_stage      = search_stage,
         )
 
     def _no_answer(
@@ -942,6 +1031,7 @@ class RagChain:
         language: str,
         original_question: str,
         retrieved_with: str,
+        search_stage: str = "all",
     ) -> AskResponse:
         return AskResponse(
             answer            = NO_ANSWER,
@@ -952,7 +1042,63 @@ class RagChain:
             retrieved_with    = retrieved_with,
             sources           = [],
             has_contradiction = False,
+            search_stage      = search_stage,
         )
+
+    def _two_stage_retrieve(
+        self,
+        q_vec: list,
+        retrieval_question: str,
+        product: str,
+    ) -> Optional[tuple[list, str]]:
+        """
+        Two-stage retrieval for portal product.
+
+        Stage 1: search_stage="1" (glossary + FAQ).
+        If top re-rank score >= rerank_threshold → return (top_chunks, "stage1").
+
+        Stage 2: search_stage="2" (guides / other docs).
+        Return (top_chunks, "stage2") regardless of score — caller applies gate.
+
+        Returns None if no documents found in either stage.
+        """
+        col = self._collection()
+
+        def _query_stage(stage: str) -> Optional[list]:
+            where = {
+                "$and": [
+                    {"search_stage": {"$eq": stage}},
+                    {"product":      {"$eq": product}},
+                ]
+            }
+            try:
+                res = col.query(
+                    query_embeddings=[q_vec],
+                    n_results=self.top_k_retrieval,
+                    where=where,
+                    include=["documents", "metadatas", "distances"],
+                )
+            except Exception as exc:
+                log.error("Stage %s ChromaDB query failed: %s", stage, exc)
+                return None
+            docs  = res["documents"][0]
+            metas = res["metadatas"][0]
+            if not docs:
+                return None
+            pairs  = [(retrieval_question, d) for d in docs]
+            scores = self._rerank.predict(pairs).tolist()
+            return sorted(zip(scores, docs, metas), key=lambda t: t[0], reverse=True)
+
+        # Stage 1
+        ranked1 = _query_stage("1")
+        if ranked1 and ranked1[0][0] >= self.rerank_threshold:
+            return ranked1[: self.top_k_rerank], "stage1"
+
+        # Stage 2 — fallback
+        ranked2 = _query_stage("2")
+        if ranked2 is None:
+            return None
+        return ranked2[: self.top_k_rerank], "stage2"
 
     def _ollama_raw(
         self,
@@ -960,6 +1106,7 @@ class RagChain:
         max_tokens: int = 512,
         timeout: float = 120.0,
         raise_on_timeout: bool = False,
+        num_ctx: Optional[int] = None,
     ) -> str:
         """
         Send a prompt to Ollama and return the response text.
@@ -977,6 +1124,7 @@ class RagChain:
                 "temperature": 0.1,
                 "top_p":       0.9,
                 "num_predict": max_tokens,
+                "num_ctx":     num_ctx if num_ctx is not None else self.num_ctx,
             },
         }
         try:

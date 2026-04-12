@@ -7,5 +7,6 @@ from .docx_parser import parse_docx
 from .excel_parser import parse_excel
 from .text_parser import parse_txt
 from .url_parser import parse_url
+from .glossary_docx_parser import parse_glossary_docx
 
-__all__ = ["parse_pdf", "parse_docx", "parse_excel", "parse_txt", "parse_url"]
+__all__ = ["parse_pdf", "parse_docx", "parse_excel", "parse_txt", "parse_url", "parse_glossary_docx"]

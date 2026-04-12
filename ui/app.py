@@ -288,6 +288,8 @@ if "analyse_text" not in st.session_state:
     st.session_state.analyse_text = ""
 if "generated_reply" not in st.session_state:
     st.session_state.generated_reply = None
+if "reply_elapsed" not in st.session_state:
+    st.session_state.reply_elapsed = None
 if "summaries" not in st.session_state:
     st.session_state.summaries = {}  # key: message index, value: summary dict | "loading" | None
 
@@ -327,11 +329,12 @@ SCOPE_DISPLAY = {
 }
 
 SOURCE_ICONS = {
-    "xlsx": "📊",
-    "pdf":  "📄",
-    "url":  "🌐",
-    "docx": "📝",
-    "txt":  "📃",
+    "xlsx":         "📊",
+    "pdf":          "📄",
+    "url":          "🌐",
+    "docx":         "📝",
+    "txt":          "📃",
+    "glossary_docx": "📖",
 }
 
 PRODUCT_BADGES = {
@@ -586,6 +589,15 @@ def render_source_card(source: dict) -> None:
     conf_badge = CONFIDENCE_BADGES.get(conf, CONFIDENCE_BADGES["medium"])
     snippet    = excerpt[:200] + "…" if len(excerpt) > 200 else excerpt
 
+    more_info     = source.get("more_information", "") or ""
+    more_info_html = ""
+    if src_type == "glossary_docx" and more_info:
+        more_info_html = (
+            f'<div style="font-size:11px;color:#6B7280;margin-top:6px;'
+            f'border-top:1px solid #E5E7EB;padding-top:6px;">'
+            f'<b>Further reading:</b><br>{more_info}</div>'
+        )
+
     st.markdown(f"""
 <div style="background:#F9FAFB;border:1px solid #E5E7EB;
             border-radius:8px;padding:12px;margin-bottom:6px;
@@ -604,6 +616,7 @@ def render_source_card(source: dict) -> None:
     </div>
   </div>
   <div style="font-size:12px;color:#6B7280;line-height:1.5;">{snippet}</div>
+  {more_info_html}
   {_url_link(url)}
 </div>
 """, unsafe_allow_html=True)
@@ -638,10 +651,19 @@ def render_assistant_message(
 </div>
 """, unsafe_allow_html=True)
 
-    # Scope indicator
+    # Scope + stage indicator
     scope_label = SCOPE_DISPLAY.get(product_scope, "All Products")
+    stage_labels = {
+        "stage1": "Glossary & FAQ",
+        "stage2": "Portal Documentation",
+        "all":    "All Sources",
+    }
+    search_stage = msg.get("search_stage", "all")
+    stage_label  = stage_labels.get(search_stage, "All Sources")
     st.markdown(
-        f'<span style="font-size:11px;color:#6B7280;">🔍 Searched: {scope_label}</span>',
+        f'<span style="font-size:11px;color:#6B7280;">'
+        f'🔍 Searched: {scope_label} · {stage_label}'
+        f'</span>',
         unsafe_allow_html=True,
     )
 
@@ -1471,6 +1493,15 @@ elif mode == "📧 Draft Reply":
                             for _src in _sources:
                                 render_source_card(_src)
 
+                    if _result.get("response_time"):
+                        st.markdown(
+                            f'<div style="font-size:11px;color:#9CA3AF;'
+                            f'text-align:right;margin-top:4px;">'
+                            f'Answered in {_result["response_time"]:.0f}s'
+                            f'</div>',
+                            unsafe_allow_html=True,
+                        )
+
                 else:
                     st.markdown("""
 <div style="background:#FFF7ED;border:1px solid #FED7AA;border-radius:8px;
@@ -1572,6 +1603,8 @@ elif mode == "📧 Draft Reply":
                         _r["current_question"] = st.session_state.get(f"q_{_qn}", _r["current_question"])
                     with st.spinner(f"Generating reply with {OLLAMA_MODEL}..."):
                         try:
+                            import time as _time
+                            reply_start = _time.time()
                             _gr = requests.post(
                                 f"{API_HOST}/generate_reply",
                                 json={
@@ -1583,6 +1616,7 @@ elif mode == "📧 Draft Reply":
                             )
                             _gr.raise_for_status()
                             st.session_state.generated_reply = _gr.json().get("reply", "")
+                            st.session_state.reply_elapsed = round(_time.time() - reply_start, 1)
                         except Exception as _e:
                             st.error(f"Failed to generate reply: {_e}")
 
@@ -1640,9 +1674,21 @@ elif mode == "📧 Draft Reply":
                 with _col3:
                     if st.button("🔄 Regenerate", use_container_width=True, key="regenerate_reply", type="secondary"):
                         st.session_state.generated_reply = None
+                        st.session_state.reply_elapsed = None
                         st.rerun()
 
-                st.markdown("""
+                _reply_elapsed = st.session_state.get("reply_elapsed")
+                if _reply_elapsed:
+                    st.markdown(
+                        f'<div style="font-size:11px;color:#9CA3AF;'
+                        f'text-align:center;margin-top:4px;">'
+                        f'Reply generated in {_reply_elapsed:.0f}s · '
+                        f'Always review before sending'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.markdown("""
 <div style="font-size:11px;color:#9CA3AF;margin-top:12px;text-align:center;">
   This reply was generated from AirPlus documentation. Always review before sending.
 </div>

@@ -1,0 +1,8 @@
+{
+  "stage1": [
+    "glossary-portal-en.docx",
+    "faq-portal-en.pdf",
+    "faq-virtual-cards-hotel-en.pdf"
+  ],
+  "description": "Stage 1 files are searched first (glossary + FAQ). Stage 2 files are searched only if Stage 1 returns no confident answer."
+}

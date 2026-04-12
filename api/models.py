@@ -25,12 +25,13 @@ class SourceReference(BaseModel):
     label: str                   # human-readable e.g. "glossary.xlsx — Term: Payment"
     excerpt: str                 # up to 200 chars of chunk content
     confidence: str              # "high" | "medium" | "low"
-    source_type: str             # "pdf" | "xlsx" | "url" | "docx" | "txt"
+    source_type: str             # "pdf" | "xlsx" | "url" | "docx" | "txt" | "glossary_docx"
     product: str
     url: Optional[str] = None
     page_number: Optional[int] = None
     sheet_name: Optional[str] = None
     question_text: Optional[str] = None
+    more_information: Optional[str] = None
     ingested_at: str
 
 
@@ -43,6 +44,7 @@ class AskResponse(BaseModel):
     retrieved_with: str          # question used for retrieval (translated if non-EN)
     sources: List[SourceReference]
     has_contradiction: bool = False  # True if LLM detected conflict across sources
+    search_stage: str = "all"    # "stage1" | "stage2" | "all"
 
 
 class IngestStatus(BaseModel):

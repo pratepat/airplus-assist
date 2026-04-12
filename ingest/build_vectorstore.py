@@ -8,6 +8,7 @@ and upserts into ChromaDB as a fresh collection (full replace).
 Run with: docker compose --profile ingest run --rm ingest python build_vectorstore.py
 """
 
+import json
 import os
 import sys
 import hashlib
@@ -19,7 +20,7 @@ load_dotenv()
 
 import chromadb
 from embedder import get_embedder, embed_texts
-from parsers import parse_pdf, parse_docx, parse_excel, parse_txt, parse_url
+from parsers import parse_pdf, parse_docx, parse_excel, parse_txt, parse_url, parse_glossary_docx
 
 # ── Config from environment ────────────────────────────────────────────────────
 CHROMA_HOST       = os.environ["CHROMA_HOST"]
@@ -53,6 +54,15 @@ def collect_chunks_from_product(product_dir: Path) -> tuple[list[dict], list[str
     chunks: list[dict] = []
     errors: list[str] = []
 
+    # Load stage config if present
+    stage1_files: set[str] = set()
+    stage_config_path = product_dir / "stage_config.json"
+    if stage_config_path.exists():
+        with open(stage_config_path) as f:
+            config = json.load(f)
+        stage1_files = set(config.get("stage1", []))
+        print(f"  [stage] stage_config.json loaded — stage1: {sorted(stage1_files)}")
+
     for file_path in sorted(product_dir.iterdir()):
         if file_path.is_dir():
             continue
@@ -60,30 +70,37 @@ def collect_chunks_from_product(product_dir: Path) -> tuple[list[dict], list[str
         suffix = file_path.suffix.lower()
         name   = file_path.name
 
-        # Skip hidden / system files
-        if name.startswith("."):
+        # Skip hidden / system files and stage_config.json
+        if name.startswith(".") or name == "stage_config.json":
             continue
+
+        search_stage = "1" if name in stage1_files else "2"
 
         try:
             if suffix == ".pdf":
                 result = parse_pdf(file_path, product)
                 chunks.extend(result)
-                print(f"  [pdf]   {name}: {len(result)} chunks")
+                print(f"  [pdf]   {name}: {len(result)} chunks  (stage {search_stage})")
 
             elif suffix == ".docx":
-                result = parse_docx(file_path, product)
-                chunks.extend(result)
-                print(f"  [docx]  {name}: {len(result)} chunks")
+                if file_path.stem.startswith("glossary"):
+                    result = parse_glossary_docx(file_path, product)
+                    chunks.extend(result)
+                    print(f"  [glossary_docx] {name}: {len(result)} chunks  (stage {search_stage})")
+                else:
+                    result = parse_docx(file_path, product)
+                    chunks.extend(result)
+                    print(f"  [docx]  {name}: {len(result)} chunks  (stage {search_stage})")
 
             elif suffix == ".xlsx":
                 result = parse_excel(file_path, product)
                 chunks.extend(result)
-                print(f"  [xlsx]  {name}: {len(result)} chunks")
+                print(f"  [xlsx]  {name}: {len(result)} chunks  (stage {search_stage})")
 
             elif suffix == ".txt" and name != "urls.txt":
                 result = parse_txt(file_path, product)
                 chunks.extend(result)
-                print(f"  [txt]   {name}: {len(result)} chunks")
+                print(f"  [txt]   {name}: {len(result)} chunks  (stage {search_stage})")
 
             elif name == "urls.txt":
                 # Parse each URL in the file
@@ -99,10 +116,16 @@ def collect_chunks_from_product(product_dir: Path) -> tuple[list[dict], list[str
                         msg = f"URL {url}: {exc}"
                         errors.append(msg)
                         print(f"  [url]   WARNING: {msg}")
-                print(f"  [url]   {name}: {url_total} chunks from {len(urls)} URL(s)")
+                print(f"  [url]   {name}: {url_total} chunks from {len(urls)} URL(s)  (stage {search_stage})")
 
             else:
                 print(f"  [skip]  {name}: unsupported format")
+                continue
+
+            # Tag all chunks in this file with search_stage and more_information default
+            for chunk in chunks[-len(result):]:
+                chunk["metadata"].setdefault("search_stage", search_stage)
+                chunk["metadata"].setdefault("more_information", "")
 
         except Exception as exc:
             msg = f"{name}: {exc}"
