@@ -143,8 +143,9 @@ class RagChain:
         self.top_k_rerank      = int(os.environ.get("TOP_K_RERANK", 3))
         self.sim_threshold     = float(os.environ.get("SIMILARITY_THRESHOLD", 0.30))
         self.rerank_threshold  = float(os.environ.get("RERANK_THRESHOLD", -0.50))
-        self.num_ctx           = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
-        self.summary_num_ctx   = int(os.getenv("OLLAMA_SUMMARY_NUM_CTX", "12288"))
+        self.num_ctx                  = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
+        self.summary_num_ctx          = int(os.getenv("OLLAMA_SUMMARY_NUM_CTX", "12288"))
+        self.stage1_quality_threshold = float(os.getenv("STAGE1_QUALITY_THRESHOLD", "2.0"))
 
         log.info("Similarity threshold: %s", self.sim_threshold)
 
@@ -388,16 +389,19 @@ class RagChain:
             )[0].tolist()
             result = self._two_stage_retrieve(q_vec, retrieval_question, product)
             if result is None:
+                log.info(
+                    "[AirPlus Assist] Q: %.60s | lang=%s | portal gate=BLOCK | confidence=none",
+                    question, language,
+                )
                 return self._no_answer(product_scope, language, original_question, retrieval_question)
             top_chunks, search_stage_used = result
             top_rerank_score = top_chunks[0][0]
-            if top_rerank_score < self.rerank_threshold:
-                log.info(
-                    "[AirPlus Assist] Q: %.60s | lang=%s | stage=%s | "
-                    "top_rerank=%.3f | gate=BLOCK | confidence=none",
-                    question, language, search_stage_used, top_rerank_score,
-                )
-                return self._no_answer(product_scope, language, original_question, retrieval_question)
+            log.info(
+                "[AirPlus Assist] Q: %.60s | lang=%s | stage=%s | "
+                "top_rerank=%.3f | gate=PASS | confidence=%s",
+                question, language, search_stage_used, top_rerank_score,
+                "high" if top_rerank_score >= 3.0 else "medium",
+            )
             return self._generate_answer(
                 question=original_question,
                 retrieval_question=retrieval_question,
@@ -503,17 +507,6 @@ class RagChain:
                     "message": f"Found {len(top_chunks)} sources ({search_stage_used}). Re-ranking complete.",
                     "icon":    "📚",
                 })
-
-                if top_rerank_score < self.rerank_threshold:
-                    log.info(
-                        "[AirPlus Assist] Q: %.60s | lang=%s | stage=%s | "
-                        "top_rerank=%.3f | gate=BLOCK | confidence=none",
-                        question, language, search_stage_used, top_rerank_score,
-                    )
-                    yield event({"stage": "complete", "result": self._no_answer(
-                        product_scope, language, original_question, retrieval_question
-                    ).dict()})
-                    return
 
                 yield event({
                     "stage":   "generating",
@@ -1054,13 +1047,19 @@ class RagChain:
         """
         Two-stage retrieval for portal product.
 
-        Stage 1: search_stage="1" (glossary + FAQ).
-        If top re-rank score >= rerank_threshold → return (top_chunks, "stage1").
+        Three-tier decision using two separate thresholds:
 
-        Stage 2: search_stage="2" (guides / other docs).
-        Return (top_chunks, "stage2") regardless of score — caller applies gate.
+          rerank_threshold (-0.50)       — hallucination gate: block completely
+                                           irrelevant queries in both stages.
+          stage1_quality_threshold (2.0) — quality gate: Stage 1 must score this
+                                           well to be considered a confident answer.
+                                           Below → fall through to Stage 2.
+                                           Stage 2 must independently pass the
+                                           hallucination gate (-0.50) to be used.
+                                           If neither passes → block entirely.
 
-        Returns None if no documents found in either stage.
+        Returns (top_chunks, stage_label) or None if nothing passes the gate.
+        stage_label: "stage1" | "stage2"
         """
         col = self._collection()
 
@@ -1089,16 +1088,47 @@ class RagChain:
             scores = self._rerank.predict(pairs).tolist()
             return sorted(zip(scores, docs, metas), key=lambda t: t[0], reverse=True)
 
-        # Stage 1
-        ranked1 = _query_stage("1")
-        if ranked1 and ranked1[0][0] >= self.rerank_threshold:
+        # ── Stage 1: Glossary + FAQ ───────────────────────────────────────────
+        ranked1       = _query_stage("1")
+        top1_score    = ranked1[0][0] if ranked1 else -999.0
+
+        log.info(
+            "[AirPlus Assist] two-stage | stage1_top=%.3f | "
+            "gate=%.2f | quality=%.2f",
+            top1_score, self.rerank_threshold, self.stage1_quality_threshold,
+        )
+
+        # Hallucination gate — completely off-domain for this product
+        if top1_score < self.rerank_threshold:
+            log.info("[AirPlus Assist] two-stage | stage1 BLOCKED (below gate)")
+            return None
+
+        # Quality gate — Stage 1 is confident enough to answer directly
+        if top1_score >= self.stage1_quality_threshold:
+            log.info("[AirPlus Assist] two-stage | stage1 CONFIDENT → returning stage1")
             return ranked1[: self.top_k_rerank], "stage1"
 
-        # Stage 2 — fallback
-        ranked2 = _query_stage("2")
-        if ranked2 is None:
-            return None
-        return ranked2[: self.top_k_rerank], "stage2"
+        # ── Stage 2: Guides / other docs ─────────────────────────────────────
+        ranked2    = _query_stage("2")
+        top2_score = ranked2[0][0] if ranked2 else -999.0
+
+        log.info(
+            "[AirPlus Assist] two-stage | stage1 score %.3f below quality threshold "
+            "→ checking stage2 (top=%.3f)",
+            top1_score, top2_score,
+        )
+
+        # Stage 2 must also pass the hallucination gate to be usable
+        if ranked2 and top2_score >= self.rerank_threshold:
+            log.info("[AirPlus Assist] two-stage | stage2 passes gate → returning stage2 (%.3f)", top2_score)
+            return ranked2[: self.top_k_rerank], "stage2"
+
+        # Neither stage has a confident answer — block entirely
+        log.info(
+            "[AirPlus Assist] two-stage | BLOCKED — stage1=%.3f stage2=%.3f both below gate %.2f",
+            top1_score, top2_score, self.rerank_threshold,
+        )
+        return None
 
     def _ollama_raw(
         self,

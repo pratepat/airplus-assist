@@ -1,4 +1,5 @@
 import os
+import re
 import time
 from datetime import datetime, timezone
 from typing import Optional
@@ -374,6 +375,25 @@ def _fmt_timestamp(iso: str) -> str:
         return iso
 
 
+# ── Response normalisation ────────────────────────────────────────────────────
+
+_NO_INFO_PHRASE = "don't have enough information"
+
+def normalise_response(response: dict) -> dict:
+    """
+    If the LLM answered with a no-information phrase despite a non-none
+    confidence, force confidence=none and clear sources/contradiction so
+    the UI renders the no-answer state correctly.
+    """
+    answer = response.get("answer", "").lower()
+    if _NO_INFO_PHRASE in answer and response.get("confidence") != "none":
+        response = dict(response)
+        response["confidence"]       = "none"
+        response["sources"]          = []
+        response["has_contradiction"] = False
+    return response
+
+
 # ── API calls ─────────────────────────────────────────────────────────────────
 
 def call_ask(question: str, lang: str, prod: Optional[str]) -> dict:
@@ -383,7 +403,7 @@ def call_ask(question: str, lang: str, prod: Optional[str]) -> dict:
         timeout=REQUEST_TIMEOUT,
     )
     resp.raise_for_status()
-    return resp.json()
+    return normalise_response(resp.json())
 
 
 def call_ask_streaming(question: str, language: str, product: Optional[str]):
@@ -481,6 +501,7 @@ CONFIDENCE_BADGES = {
 }
 
 
+
 def _url_link(url: Optional[str]) -> str:
     if not url:
         return ""
@@ -573,51 +594,113 @@ def _further_card(source: dict) -> str:
 """
 
 
+import re as _re
+
+
+def _linkify(text: str) -> str:
+    """Convert URLs in plain text to HTML links."""
+    return _re.sub(
+        r'(https?://[^\s<>"]+)',
+        lambda m: (
+            f'<a href="{m.group(1)}" '
+            f'target="_blank" '
+            f'style="color:#00B050;'
+            f'word-break:break-all;">'
+            f'{m.group(1)}</a>'
+        ),
+        text
+    )
+
+
 def render_source_card(source: dict) -> None:
-    """Render a single source as a compact card — used in both chat and analyse tabs."""
-    src_type   = source.get("source_type", "txt")
-    icon       = SOURCE_ICONS.get(src_type, "📄")
-    label      = source.get("label", "")
-    excerpt    = source.get("excerpt", "")
-    product    = source.get("product", "")
-    url        = source.get("url")
-    rank       = source.get("rank", 1)
-    conf       = source.get("confidence", "medium")
+    rank    = source.get("rank", 1)
+    label   = source.get("label", "Source")
+    excerpt = source.get("excerpt", "")
+    conf    = source.get("confidence", "medium")
+    product = source.get("product", "")
+    url     = source.get("url") or ""
+    source_type = source.get("source_type", "")
+    more_info = (source.get("more_information")
+                 or "").strip()
 
     rank_sym   = RANK_SYMBOLS.get(rank, str(rank))
     badge      = PRODUCT_BADGES.get(product, "")
-    conf_badge = CONFIDENCE_BADGES.get(conf, CONFIDENCE_BADGES["medium"])
-    snippet    = excerpt[:200] + "…" if len(excerpt) > 200 else excerpt
+    conf_badge = CONFIDENCE_BADGES.get(
+        conf, CONFIDENCE_BADGES["medium"])
+    snippet = (excerpt[:200] + "…"
+               if len(excerpt) > 200 else excerpt)
 
-    more_info     = source.get("more_information", "") or ""
-    more_info_html = ""
-    if src_type == "glossary_docx" and more_info:
-        more_info_html = (
-            f'<div style="font-size:11px;color:#6B7280;margin-top:6px;'
-            f'border-top:1px solid #E5E7EB;padding-top:6px;">'
-            f'<b>Further reading:</b><br>{more_info}</div>'
+    icon = {
+        "glossary_docx": "📖",
+        "pdf": "📄",
+        "xlsx": "📊",
+        "txt": "📝",
+        "url": "🌐",
+    }.get(source_type, "📄")
+
+    url_html = ""
+    if url:
+        url_html = (
+            f'<a href="{url}" target="_blank" '
+            f'style="font-size:11px;color:#00B050;">'
+            f'🔗 Open source →</a>'
         )
 
+    more_info_html = ""
+    if more_info:
+        linkified = _linkify(
+            more_info.replace("\n", "<br>"))
+        more_info_html = f"""
+        <div style="margin-top:8px;
+                    padding-top:8px;
+                    border-top:1px solid #E5E7EB;
+                    font-size:11px;
+                    color:#4B5563;
+                    line-height:1.8;">
+          <strong style="color:#374151;">
+            📎 Further reading:
+          </strong><br>
+          {linkified}
+        </div>"""
+
     st.markdown(f"""
-<div style="background:#F9FAFB;border:1px solid #E5E7EB;
-            border-radius:8px;padding:12px;margin-bottom:6px;
+<div style="background:#F9FAFB;
+            border:1px solid #E5E7EB;
+            border-radius:8px;
+            padding:12px;
+            margin-bottom:6px;
             border-left:4px solid #00B050;">
-  <div style="display:flex;justify-content:space-between;
-              align-items:center;margin-bottom:6px;">
+  <div style="display:flex;
+              justify-content:space-between;
+              align-items:center;
+              margin-bottom:6px;">
     <span>
-      <span style="font-size:11px;font-weight:700;
-                   color:#00B050;margin-right:6px;">{rank_sym}</span>
-      <span style="font-weight:600;font-size:13px;
-                   color:#1A1A2E;">{icon} {label}</span>
+      <span style="font-size:11px;
+                   font-weight:700;
+                   color:#00B050;
+                   margin-right:6px;">
+        {rank_sym}
+      </span>
+      <span style="font-weight:600;
+                   font-size:13px;
+                   color:#1A1A2E;">
+        {icon} {label}
+      </span>
     </span>
-    <div style="display:flex;gap:6px;flex-shrink:0;margin-left:8px;">
-      {badge}
-      {conf_badge}
+    <div style="display:flex;
+                gap:6px;
+                flex-shrink:0;
+                margin-left:8px;">
+      {badge}{conf_badge}
     </div>
   </div>
-  <div style="font-size:12px;color:#6B7280;line-height:1.5;">{snippet}</div>
+  <div style="font-size:12px;
+              color:#6B7280;
+              line-height:1.5;">
+    {snippet}
+  </div>
+  {url_html}
   {more_info_html}
-  {_url_link(url)}
 </div>
 """, unsafe_allow_html=True)
 
@@ -640,8 +723,8 @@ def render_assistant_message(
         st.markdown(CONFIDENCE_PILLS[confidence], unsafe_allow_html=True)
         st.markdown("")
 
-    # Contradiction banner
-    if has_contradiction:
+    # Contradiction banner — only when answer was actually provided
+    if has_contradiction and confidence != "none":
         st.markdown("""
 <div style="background:#FFFBEB;border:1px solid #FCD34D;
             border-radius:8px;padding:10px 14px;
@@ -1212,7 +1295,7 @@ if mode == "💬 Chat":
                     elapsed = time.time() - start_time
 
                     if stage == "complete":
-                        final_response = evt.get("result")
+                        final_response = normalise_response(evt.get("result") or {})
                         break
 
                     elif stage == "error":
