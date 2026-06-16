@@ -40,7 +40,7 @@ resource embeddingDeployment 'Microsoft.CognitiveServices/accounts/deployments@2
   parent: openAiAccount
   name: 'text-embedding-3-small'
   sku: {
-    name: 'Standard'
+    name: 'GlobalStandard'
     capacity: 50
   }
   properties: {
@@ -58,7 +58,7 @@ resource chatDeployment 'Microsoft.CognitiveServices/accounts/deployments@2026-0
   name: 'gpt-4o-mini'
   dependsOn: [embeddingDeployment]
   sku: {
-    name: 'Standard'
+    name: 'GlobalStandard'
     capacity: 10
   }
   properties: {
