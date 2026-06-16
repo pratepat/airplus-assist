@@ -79,7 +79,7 @@ def _get_index_client() -> SearchIndexClient:
 def ensure_index() -> None:
     """Create the Azure AI Search index if it doesn't already exist."""
     client = _get_index_client()
-    existing = {idx.name for idx in client.list_index_names()}
+    existing = set(client.list_index_names())
     if config.azure_search_index in existing:
         log.info("Index '%s' already exists", config.azure_search_index)
         return

@@ -28,13 +28,8 @@ resource openAiAccount 'Microsoft.CognitiveServices/accounts@2026-03-01' = {
   }
 }
 
-resource openAiDefenderSettings 'Microsoft.CognitiveServices/accounts/defenderForAISettings@2026-03-01' = {
-  parent: openAiAccount
-  name: 'Default'
-  properties: {
-    state: 'Disabled'
-  }
-}
+// Defender settings omitted — modifying this child resource causes RequestConflict
+// on the parent account when OpenAI deployments are still settling.
 
 resource embeddingDeployment 'Microsoft.CognitiveServices/accounts/deployments@2026-03-01' = {
   parent: openAiAccount

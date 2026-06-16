@@ -184,7 +184,7 @@ Best regards,
 
 <!-- Pass server-side values to JS -->
 <script>
-  window.OLLAMA_MODEL = {{ ollama_model | tojson }};
+  window.OLLAMA_MODEL = {{ chat_model | tojson }};
   window.AVAILABLE_PRODUCTS = {{ products | tojson }};
 </script>
 <script src="/static/js/app.js"></script>
