@@ -1,90 +1,193 @@
 """
-Document ingestion: parse all supported formats, chunk, embed, store in memory.
+Document ingestion: parse all supported formats, chunk, embed via Azure OpenAI,
+and upload to Azure AI Search.
 
-Supported formats: PDF, DOCX, XLSX, TXT (including Q&A format), URLs (urls.txt)
+Supported formats: PDF, DOCX, XLSX, TXT (including Q&A format), URLs (urls.txt),
+                   Glossary DOCX (specialized table parser)
 """
 import hashlib
+import json
 import logging
-import pickle
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
-import numpy as np
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from openai import AzureOpenAI
+from azure.search.documents import SearchClient
+from azure.search.documents.indexes import SearchIndexClient
+from azure.search.documents.indexes.models import (
+    HnswAlgorithmConfiguration,
+    SearchableField,
+    SearchField,
+    SearchFieldDataType,
+    SearchIndex,
+    SemanticConfiguration,
+    SemanticField,
+    SemanticPrioritizedFields,
+    SemanticSearch,
+    SimpleField,
+    VectorSearch,
+    VectorSearchProfile,
+)
+from azure.core.credentials import AzureKeyCredential
 
 from .config import config
 
 log = logging.getLogger(__name__)
 
-_CACHE_FILE = Path(__file__).parent.parent / ".cache" / "ingest_cache.pkl"
+# ── Azure clients (module-level, created lazily) ───────────────────────────────
+
+_openai_client: AzureOpenAI | None = None
+_search_client: SearchClient | None = None
+_index_client: SearchIndexClient | None = None
 
 
-def _fingerprint(docs_path: Path) -> str:
-    """MD5 of all document file paths + mtimes + sizes + ingest-relevant config."""
-    parts: list[str] = []
-    if docs_path.exists():
-        for f in sorted(docs_path.rglob("*")):
-            if f.is_file() and not f.name.startswith("."):
-                st = f.stat()
-                parts.append(f"{f}:{st.st_mtime}:{st.st_size}")
-    parts.append(f"embed_model:{config.embed_model}")
-    parts.append(f"chunk_size:{config.chunk_size}")
-    parts.append(f"chunk_overlap:{config.chunk_overlap}")
-    return hashlib.md5("\n".join(parts).encode()).hexdigest()
+def _get_openai() -> AzureOpenAI:
+    global _openai_client
+    if _openai_client is None:
+        _openai_client = AzureOpenAI(
+            azure_endpoint=config.azure_openai_endpoint,
+            api_key=config.azure_openai_api_key or None,
+            api_version=config.azure_openai_api_version,
+        )
+    return _openai_client
 
 
-def _load_cache(fp: str) -> "IngestResult | None":
-    if not _CACHE_FILE.exists():
-        return None
-    try:
-        with open(_CACHE_FILE, "rb") as fh:
-            data = pickle.load(fh)
-        if data.get("fingerprint") != fp:
-            log.info("Documents changed — cache invalid, re-ingesting")
-            return None
-        r = IngestResult()
-        r.chunks      = data["chunks"]
-        r.embeddings  = data["embeddings"]
-        r.products    = data["products"]
-        r.total       = data["total"]
-        r.ingested_at = data["ingested_at"]
-        log.info("Cache hit — %d chunks, %d product(s) (skipping embed step)",
-                 r.total, len(r.products))
-        return r
-    except Exception as exc:
-        log.warning("Cache load failed (%s) — will re-ingest", exc)
-        return None
+def _get_search_client() -> SearchClient:
+    global _search_client
+    if _search_client is None:
+        _search_client = SearchClient(
+            endpoint=config.azure_search_endpoint,
+            index_name=config.azure_search_index,
+            credential=AzureKeyCredential(config.azure_search_key),
+        )
+    return _search_client
 
 
-def _save_cache(result: "IngestResult", fp: str) -> None:
-    try:
-        _CACHE_FILE.parent.mkdir(exist_ok=True)
-        with open(_CACHE_FILE, "wb") as fh:
-            pickle.dump({
-                "fingerprint": fp,
-                "chunks":      result.chunks,
-                "embeddings":  result.embeddings,
-                "products":    result.products,
-                "total":       result.total,
-                "ingested_at": result.ingested_at,
-            }, fh)
-        log.info("Ingest cache saved (%d chunks)", result.total)
-    except Exception as exc:
-        log.warning("Cache save failed: %s", exc)
+def _get_index_client() -> SearchIndexClient:
+    global _index_client
+    if _index_client is None:
+        _index_client = SearchIndexClient(
+            endpoint=config.azure_search_endpoint,
+            credential=AzureKeyCredential(config.azure_search_key),
+        )
+    return _index_client
 
 
-# Module-level model cache so ingest and RAG share the same instance
-_embed_model_cache: dict[str, Any] = {}
+# ── Index management ───────────────────────────────────────────────────────────
+
+def ensure_index() -> None:
+    """Create the Azure AI Search index if it doesn't already exist."""
+    client = _get_index_client()
+    existing = {idx.name for idx in client.list_index_names()}
+    if config.azure_search_index in existing:
+        log.info("Index '%s' already exists", config.azure_search_index)
+        return
+
+    log.info("Creating index '%s' …", config.azure_search_index)
+    index = SearchIndex(
+        name=config.azure_search_index,
+        fields=[
+            SimpleField(name="id", type=SearchFieldDataType.String, key=True),
+            SearchableField(name="content", type=SearchFieldDataType.String),
+            SimpleField(name="product",       type=SearchFieldDataType.String, filterable=True, retrievable=True),
+            SimpleField(name="source_file",   type=SearchFieldDataType.String, retrievable=True),
+            SimpleField(name="source_type",   type=SearchFieldDataType.String, filterable=True, retrievable=True),
+            SimpleField(name="search_stage",  type=SearchFieldDataType.String, filterable=True, retrievable=True),
+            SimpleField(name="page_number",   type=SearchFieldDataType.Int32,  retrievable=True),
+            SimpleField(name="sheet_name",    type=SearchFieldDataType.String, retrievable=True),
+            SearchableField(name="question_text", type=SearchFieldDataType.String, retrievable=True),
+            SimpleField(name="url",            type=SearchFieldDataType.String, retrievable=True),
+            SimpleField(name="section_title",  type=SearchFieldDataType.String, retrievable=True),
+            SimpleField(name="more_information", type=SearchFieldDataType.String, retrievable=True),
+            SimpleField(name="ingested_at",    type=SearchFieldDataType.String, retrievable=True),
+            SimpleField(name="chunk_index",    type=SearchFieldDataType.Int32,  retrievable=True),
+            SearchField(
+                name="content_vector",
+                type=SearchFieldDataType.Collection(SearchFieldDataType.Single),
+                searchable=True,
+                vector_search_dimensions=1536,
+                vector_search_profile_name="hnsw-profile",
+            ),
+        ],
+        vector_search=VectorSearch(
+            algorithms=[HnswAlgorithmConfiguration(name="hnsw")],
+            profiles=[VectorSearchProfile(name="hnsw-profile", algorithm_configuration_name="hnsw")],
+        ),
+        semantic_search=SemanticSearch(
+            configurations=[
+                SemanticConfiguration(
+                    name="semantic_config",
+                    prioritized_fields=SemanticPrioritizedFields(
+                        content_fields=[SemanticField(field_name="content")],
+                        title_field=SemanticField(field_name="question_text"),
+                    ),
+                )
+            ]
+        ),
+    )
+    client.create_index(index)
+    log.info("Index '%s' created", config.azure_search_index)
 
 
-def get_embed_model(model_name: str):
-    if model_name not in _embed_model_cache:
-        from sentence_transformers import SentenceTransformer
-        log.info("Loading embedding model: %s", model_name)
-        _embed_model_cache[model_name] = SentenceTransformer(model_name)
-    return _embed_model_cache[model_name]
+# ── Embedding ──────────────────────────────────────────────────────────────────
 
+def embed_texts(texts: list[str]) -> list[list[float]]:
+    """Embed a list of texts using Azure OpenAI. Batches up to 100 per call."""
+    client = _get_openai()
+    vectors: list[list[float]] = []
+    batch_size = 100
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i : i + batch_size]
+        response = client.embeddings.create(
+            input=batch,
+            model=config.azure_openai_embed_model,
+        )
+        vectors.extend(item.embedding for item in response.data)
+        log.info("  Embedded %d/%d", min(i + batch_size, len(texts)), len(texts))
+    return vectors
+
+
+# ── Upload to Azure AI Search ──────────────────────────────────────────────────
+
+def upload_chunks(chunks: list[dict], vectors: list[list[float]]) -> None:
+    """Merge chunks + vectors and upload to Azure AI Search in batches of 100."""
+    client = _get_search_client()
+    documents = []
+    for chunk, vector in zip(chunks, vectors):
+        meta = chunk["metadata"]
+        doc_id = hashlib.md5(
+            f"{meta.get('product')}:{meta.get('source_file')}:{meta.get('chunk_index')}:{chunk['content'][:50]}".encode()
+        ).hexdigest()
+        documents.append({
+            "id":               doc_id,
+            "content":          chunk["content"],
+            "product":          meta.get("product") or "",
+            "source_file":      meta.get("source_file") or "",
+            "source_type":      meta.get("source_type") or "",
+            "search_stage":     meta.get("search_stage") or "",
+            "page_number":      meta.get("page_number"),
+            "sheet_name":       meta.get("sheet_name") or "",
+            "question_text":    meta.get("question_text") or "",
+            "url":              meta.get("url") or "",
+            "section_title":    meta.get("section_title") or "",
+            "more_information": meta.get("more_information") or "",
+            "ingested_at":      meta.get("ingested_at") or "",
+            "chunk_index":      meta.get("chunk_index") or 0,
+            "content_vector":   vector,
+        })
+
+    batch_size = 100
+    for i in range(0, len(documents), batch_size):
+        batch = documents[i : i + batch_size]
+        result = client.upload_documents(documents=batch)
+        failed = [r for r in result if not r.succeeded]
+        if failed:
+            log.warning("  %d document(s) failed to upload in batch %d", len(failed), i // batch_size)
+    log.info("Uploaded %d documents to index '%s'", len(documents), config.azure_search_index)
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _splitter() -> RecursiveCharacterTextSplitter:
     return RecursiveCharacterTextSplitter(
@@ -95,20 +198,35 @@ def _splitter() -> RecursiveCharacterTextSplitter:
 
 def _base_meta(product: str, source_file: str, source_type: str) -> dict:
     return {
-        "product": product,
-        "source_file": source_file,
-        "source_type": source_type,
-        "page_number": None,
-        "sheet_name": None,
-        "question_text": None,
-        "url": None,
-        "section_title": None,
-        "ingested_at": datetime.now(timezone.utc).isoformat(),
-        "chunk_index": 0,
+        "product":          product,
+        "source_file":      source_file,
+        "source_type":      source_type,
+        "page_number":      None,
+        "sheet_name":       None,
+        "question_text":    None,
+        "url":              None,
+        "section_title":    None,
+        "more_information": None,
+        "search_stage":     None,
+        "ingested_at":      datetime.now(timezone.utc).isoformat(),
+        "chunk_index":      0,
     }
 
 
-# ── Parsers ────────────────────────────────────────────────────────────────────
+def _load_stage_config(product_dir: Path) -> dict | None:
+    """Load stage_config.json from a product directory, or return None if absent."""
+    cfg_path = product_dir / "stage_config.json"
+    if not cfg_path.exists():
+        return None
+    try:
+        with open(cfg_path) as fh:
+            return json.load(fh)
+    except Exception as exc:
+        log.warning("Failed to read %s: %s", cfg_path, exc)
+        return None
+
+
+# ── Parsers (unchanged from local version) ────────────────────────────────────
 
 def parse_pdf(file_path: Path, product: str) -> list[dict]:
     try:
@@ -177,6 +295,57 @@ def parse_docx(file_path: Path, product: str) -> list[dict]:
     return chunks
 
 
+def parse_glossary_docx(file_path: Path, product: str) -> list[dict]:
+    """
+    Parse a portal-style glossary Word document.
+    Expects a table with 4 columns: Letter | Topic | Description | More Information.
+    One row → one chunk, tagged as search_stage="1".
+    """
+    try:
+        from docx import Document
+    except ImportError:
+        log.warning("python-docx not installed — skipping %s", file_path.name)
+        return []
+
+    chunks = []
+    ingested_at = datetime.now(timezone.utc).isoformat()
+    try:
+        doc = Document(str(file_path))
+        if not doc.tables:
+            return chunks
+        table = doc.tables[0]
+        for i, row in enumerate(table.rows):
+            if i == 0:
+                continue
+            cells = [cell.text.strip() for cell in row.cells]
+            if len(cells) < 3:
+                continue
+            topic       = cells[1] if len(cells) > 1 else ""
+            description = cells[2] if len(cells) > 2 else ""
+            more_info   = cells[3] if len(cells) > 3 else ""
+            if not topic and not description:
+                continue
+            content_parts = []
+            if topic:
+                content_parts.append(f"Term: {topic}")
+            if description:
+                content_parts.append(f"Definition: {description}")
+            if more_info:
+                content_parts.append(f"Further reading: {more_info}")
+            content = "\n".join(content_parts)
+            meta = _base_meta(product, file_path.name, "glossary_docx")
+            meta["question_text"]    = topic
+            meta["section_title"]    = "Glossary"
+            meta["more_information"] = more_info or None
+            meta["search_stage"]     = "1"
+            meta["ingested_at"]      = ingested_at
+            meta["chunk_index"]      = i
+            chunks.append({"content": content, "metadata": meta})
+    except Exception as e:
+        log.error("Glossary DOCX parse error %s: %s", file_path.name, e)
+    return chunks
+
+
 def parse_excel(file_path: Path, product: str) -> list[dict]:
     try:
         import openpyxl
@@ -217,9 +386,9 @@ def parse_excel(file_path: Path, product: str) -> list[dict]:
                         parts.append(f"{col_name}: {str(val).strip()}")
 
                 meta = _base_meta(product, file_path.name, "xlsx")
-                meta["sheet_name"] = sheet_name
+                meta["sheet_name"]   = sheet_name
                 meta["question_text"] = key_val
-                meta["chunk_index"] = row_num
+                meta["chunk_index"]  = row_num
                 chunks.append({"content": "\n".join(parts), "metadata": meta})
         wb.close()
     except Exception as e:
@@ -237,7 +406,6 @@ def parse_txt(file_path: Path, product: str) -> list[dict]:
         log.error("TXT read error %s: %s", file_path.name, e)
         return []
 
-    # Auto-detect Q&A format
     is_qa = text.count("\nQ:") > 3 or text.startswith("Q:")
     chunks = []
 
@@ -263,7 +431,7 @@ def parse_txt(file_path: Path, product: str) -> list[dict]:
             meta = _base_meta(product, file_path.name, "txt")
             meta["question_text"] = q
             meta["section_title"] = "FAQ"
-            meta["chunk_index"] = i
+            meta["chunk_index"]   = i
             chunks.append({"content": f"Q: {q}\nA: {a}", "metadata": meta})
     else:
         sp = _splitter()
@@ -304,9 +472,9 @@ def parse_urls(file_path: Path, product: str) -> list[dict]:
             title = meta_info.title if meta_info and meta_info.title else url
             for i, piece in enumerate(sp.split_text(text)):
                 meta = _base_meta(product, file_path.name, "url")
-                meta["url"] = url
+                meta["url"]           = url
                 meta["section_title"] = title
-                meta["chunk_index"] = i
+                meta["chunk_index"]   = i
                 chunks.append({"content": piece, "metadata": meta})
             log.info("  URL %s → %d chunks", url, i + 1)
         except Exception as e:
@@ -315,44 +483,38 @@ def parse_urls(file_path: Path, product: str) -> list[dict]:
     return chunks
 
 
-# ── Ingest orchestrator ────────────────────────────────────────────────────────
+# ── Ingest summary (returned instead of IngestResult) ─────────────────────────
 
-class IngestResult:
-    """Holds all ingested chunks and their precomputed embeddings."""
-    chunks: list[dict]
-    embeddings: np.ndarray | None
+class IngestSummary:
+    """Lightweight result returned after ingest — no embeddings stored locally."""
     products: list[str]
     total: int
     ingested_at: str
 
     def __init__(self):
-        self.chunks = []
-        self.embeddings = None
-        self.products = []
-        self.total = 0
+        self.products    = []
+        self.total       = 0
         self.ingested_at = ""
 
 
-def ingest_documents(docs_path: str | Path) -> IngestResult:
+# ── Ingest orchestrator ────────────────────────────────────────────────────────
+
+def ingest_documents(docs_path: str | Path) -> IngestSummary:
     """
     Scan docs_path/{product}/ folders, parse all supported documents,
-    embed every chunk, and return an IngestResult ready for querying.
+    embed via Azure OpenAI, and upload to Azure AI Search.
 
-    Results are cached to disk keyed by a fingerprint of all document files
-    and config values. Unchanged documents skip the embed step entirely.
+    The index is created if it doesn't exist. Existing documents are
+    overwritten (upsert by deterministic id).
     """
     docs_path = Path(docs_path)
-
-    fp = _fingerprint(docs_path)
-    cached = _load_cache(fp)
-    if cached is not None:
-        return cached
-
-    result = IngestResult()
+    summary   = IngestSummary()
 
     if not docs_path.exists():
         log.warning("Documents path does not exist: %s", docs_path)
-        return result
+        return summary
+
+    ensure_index()
 
     all_chunks: list[dict] = []
     products: set[str] = set()
@@ -365,14 +527,21 @@ def ingest_documents(docs_path: str | Path) -> IngestResult:
         products.add(product)
         product_chunks: list[dict] = []
 
+        stage_cfg    = _load_stage_config(product_dir)
+        stage1_files = set(stage_cfg.get("stage1", [])) if stage_cfg else set()
+
         for file_path in sorted(product_dir.iterdir()):
             if file_path.name.startswith(".") or not file_path.is_file():
+                continue
+            if file_path.suffix.lower() == ".json":
                 continue
 
             ext  = file_path.suffix.lower()
             name = file_path.name.lower()
 
-            if ext == ".pdf":
+            if ext == ".docx" and name.startswith("glossary"):
+                fc = parse_glossary_docx(file_path, product)
+            elif ext == ".pdf":
                 fc = parse_pdf(file_path, product)
             elif ext == ".docx":
                 fc = parse_docx(file_path, product)
@@ -386,6 +555,13 @@ def ingest_documents(docs_path: str | Path) -> IngestResult:
                 log.debug("Skipping unsupported file: %s", file_path.name)
                 continue
 
+            if stage_cfg:
+                for chunk in fc:
+                    if chunk["metadata"].get("search_stage") is None:
+                        chunk["metadata"]["search_stage"] = (
+                            "1" if file_path.name in stage1_files else "2"
+                        )
+
             log.info("  %s → %d chunks", file_path.name, len(fc))
             product_chunks.extend(fc)
 
@@ -394,23 +570,20 @@ def ingest_documents(docs_path: str | Path) -> IngestResult:
 
     if not all_chunks:
         log.warning("No chunks found in %s", docs_path)
-        return result
+        return summary
 
-    # Embed all chunks
-    log.info("Embedding %d chunks with %s …", len(all_chunks), config.embed_model)
-    model = get_embed_model(config.embed_model)
-    texts = [c["content"] for c in all_chunks]
-    embeddings = model.encode(texts, show_progress_bar=True, normalize_embeddings=True)
+    log.info("Embedding %d chunks via Azure OpenAI …", len(all_chunks))
+    texts   = [c["content"] for c in all_chunks]
+    vectors = embed_texts(texts)
 
-    result.chunks = all_chunks
-    result.embeddings = np.array(embeddings, dtype=np.float32)
-    result.products = sorted(products)
-    result.total = len(all_chunks)
-    result.ingested_at = datetime.now(timezone.utc).isoformat()
+    upload_chunks(all_chunks, vectors)
+
+    summary.products    = sorted(products)
+    summary.total       = len(all_chunks)
+    summary.ingested_at = datetime.now(timezone.utc).isoformat()
 
     log.info(
         "Ingest complete: %d chunks from %d product(s): %s",
-        result.total, len(result.products), result.products,
+        summary.total, len(summary.products), summary.products,
     )
-    _save_cache(result, fp)
-    return result
+    return summary

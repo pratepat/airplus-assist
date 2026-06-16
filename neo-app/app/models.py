@@ -40,6 +40,7 @@ class SourceReference(BaseModel):
     sheet_name: Optional[str] = None
     question_text: Optional[str] = None
     ingested_at: str = ""
+    more_information: Optional[str] = None
 
 
 class AskResponse(BaseModel):
@@ -51,3 +52,4 @@ class AskResponse(BaseModel):
     retrieved_with: str      # possibly translated retrieval question
     sources: List[SourceReference]
     has_contradiction: bool = False
+    search_stage: str = "all"  # "stage1" | "stage2" | "all"

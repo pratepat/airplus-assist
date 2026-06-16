@@ -19,7 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from .config import config
-from .ingest import IngestResult, ingest_documents
+from .ingest import IngestSummary, ingest_documents
 from .models import (
     AskRequest,
     AskResponse,
@@ -37,41 +37,29 @@ log = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).parent
 
-_ingest_result: IngestResult | None = None
+_ingest_summary: IngestSummary | None = None
 _pipeline: RagPipeline | None = None
 _startup_error: str | None = None
 
 
-def _warm_up(pipeline: RagPipeline) -> None:
-    """
-    Run one dummy inference through embed and reranker so PyTorch finishes
-    any lazy compilation before the first real user request arrives.
-    """
-    pipeline._embed.encode(["warm up"], normalize_embeddings=True)
-    pipeline._reranker.predict([("warm up query", "warm up document")])
-
-
 async def _run_startup() -> None:
-    """Ingest documents, build the RAG pipeline, and warm up models."""
-    global _ingest_result, _pipeline, _startup_error
+    """Ingest documents into Azure AI Search and build the RAG pipeline."""
+    global _ingest_summary, _pipeline, _startup_error
     try:
         loop = asyncio.get_event_loop()
 
-        log.info("Step 1/3 — Ingesting documents …")
-        _ingest_result = await loop.run_in_executor(None, ingest_documents, config.documents_path)
+        log.info("Step 1/2 — Ingesting documents into Azure AI Search …")
+        _ingest_summary = await loop.run_in_executor(None, ingest_documents, config.documents_path)
 
-        if _ingest_result.total == 0:
+        if _ingest_summary.total == 0:
             log.warning("No documents found — add files to DOCUMENTS_PATH and restart.")
             return
 
-        log.info("Step 2/3 — Building RAG pipeline (%d chunks) …", _ingest_result.total)
-        _pipeline = await loop.run_in_executor(None, RagPipeline, _ingest_result)
+        log.info("Step 2/2 — Building RAG pipeline (%d chunks) …", _ingest_summary.total)
+        _pipeline = await loop.run_in_executor(None, RagPipeline, _ingest_summary)
 
-        log.info("Step 3/3 — Warming up embed + reranker models …")
-        await loop.run_in_executor(None, _warm_up, _pipeline)
-
-        log.info("=== Ready — %d chunks, %d product(s) — first request will be fast ===",
-                 _ingest_result.total, len(_ingest_result.products))
+        log.info("=== Ready — %d chunks, %d product(s) ===",
+                 _ingest_summary.total, len(_ingest_summary.products))
     except Exception as exc:
         _startup_error = str(exc)
         log.exception("Startup failed: %s", exc)
@@ -143,7 +131,7 @@ _STARTING_PAGE = """<!DOCTYPE html>
       <span class="dot"></span><span class="dot"></span><span class="dot"></span>
       <br><br>Loading knowledge base…
     </div>
-    <div class="detail">Ingesting documents and loading AI models.<br>This takes about 30–60 seconds on first run.</div>
+    <div class="detail">Ingesting documents into Azure AI Search.<br>This takes about 10–20 seconds.</div>
   </div>
 </body>
 </html>"""
@@ -160,14 +148,14 @@ async def index(request: Request):
             f"<h2>Startup error</h2><pre>{_startup_error}</pre>", status_code=500
         )
 
-    products    = _ingest_result.products    if _ingest_result else []
-    chunk_count = _ingest_result.total       if _ingest_result else 0
-    ingested_at = _ingest_result.ingested_at if _ingest_result else ""
+    products    = _ingest_summary.products    if _ingest_summary else []
+    chunk_count = _ingest_summary.total       if _ingest_summary else 0
+    ingested_at = _ingest_summary.ingested_at if _ingest_summary else ""
     return templates.TemplateResponse(request, "index.html", {
-        "products":     products,
-        "chunk_count":  chunk_count,
-        "ingested_at":  ingested_at,
-        "ollama_model": config.ollama_model,
+        "products":    products,
+        "chunk_count": chunk_count,
+        "ingested_at": ingested_at,
+        "chat_model":  config.azure_openai_chat_model,
     })
 
 
@@ -177,16 +165,18 @@ async def index(request: Request):
 async def health():
     return {
         "status":      "ok" if _pipeline else "no_documents",
-        "model":       config.ollama_model,
-        "chunk_count": _ingest_result.total    if _ingest_result else 0,
-        "products":    _ingest_result.products if _ingest_result else [],
-        "ingested_at": _ingest_result.ingested_at if _ingest_result else "",
+        "chat_model":  config.azure_openai_chat_model,
+        "embed_model": config.azure_openai_embed_model,
+        "search_index": config.azure_search_index,
+        "chunk_count": _ingest_summary.total       if _ingest_summary else 0,
+        "products":    _ingest_summary.products    if _ingest_summary else [],
+        "ingested_at": _ingest_summary.ingested_at if _ingest_summary else "",
     }
 
 
 @app.get("/api/products")
 async def products():
-    return {"products": _ingest_result.products if _ingest_result else []}
+    return {"products": _ingest_summary.products if _ingest_summary else []}
 
 
 # ── Ask ────────────────────────────────────────────────────────────────────────
