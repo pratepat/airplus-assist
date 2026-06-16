@@ -113,10 +113,12 @@ Note the values for `openAiEndpoint`, `searchEndpoint`, `acrLoginServer`, and `c
 Run from the repository root (where `Dockerfile` lives):
 
 ```bash
-docker build -t airplusacr.azurecr.io/airplus-assist:latest .
+docker build --platform linux/amd64 -t airplusacr.azurecr.io/airplus-assist:latest .
 ```
 
-The first build takes 2–4 minutes. Subsequent builds are faster due to layer caching. The image is approximately 200 MB (no PyTorch or local ML models).
+> **Apple Silicon (M1/M2/M3/M4) users:** The `--platform linux/amd64` flag is required. Without it, Docker builds an `arm64` image by default, which Azure Container Apps rejects. Cross-platform builds are slower (~5–10 minutes on first run) but produce a correct `amd64` image.
+
+The first build takes 2–10 minutes depending on your machine and platform. Subsequent builds are faster due to layer caching. The image is approximately 200 MB (no PyTorch or local ML models).
 
 ---
 
@@ -192,7 +194,7 @@ A healthy response will have:
 After a code change or document update, rebuild and push the image, then force a new Container App revision:
 
 ```bash
-docker build -t airplusacr.azurecr.io/airplus-assist:latest .
+docker build --platform linux/amd64 -t airplusacr.azurecr.io/airplus-assist:latest .
 docker push airplusacr.azurecr.io/airplus-assist:latest
 
 az containerapp update \
