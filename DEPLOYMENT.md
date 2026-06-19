@@ -92,23 +92,61 @@ This provisions:
 
 ---
 
-## Step 5 — Retrieve the deployment outputs
+## Step 5 — Retrieve the resource endpoints
+
+Because Step 4 intentionally fails (the Container App image doesn't exist yet), the deployment outputs are not populated. Retrieve the values you need directly from the created resources:
 
 ```bash
-az deployment group show \
+# Azure OpenAI endpoint
+az cognitiveservices account show \
+  --name airplus-openai \
   --resource-group airplus-assist-rg \
-  --name main \
-  --query properties.outputs \
-  --output table
+  --query properties.endpoint \
+  --output tsv
+
+# Azure AI Search endpoint
+# Format: https://<searchServiceName>.search.windows.net
+# e.g.  https://airplus-search.search.windows.net
+
+# ACR login server (used in Steps 7 and 8)
+az acr show \
+  --name airplusacr \
+  --resource-group airplus-assist-rg \
+  --query loginServer \
+  --output tsv
 ```
 
-Note the values for `openAiEndpoint`, `searchEndpoint`, `acrLoginServer`, and `containerAppUrl` — you may need them for local testing or troubleshooting.
+Note the ACR login server — you will need it in Steps 7 and 8. The Container App URL is not available until Step 9.
 
 ---
 
-## Step 6 — Build the Docker image
+## Step 6 — Upload documents to Azure Blob Storage
 
-> **Important:** The `docs/` folder must be present in the repository root before building. The Dockerfile copies documents into the image so the app can ingest them into Azure AI Search on startup.
+Documents are stored in Azure Blob Storage, not in the Docker image. Upload them once before the first deployment (or whenever the corpus changes):
+
+```bash
+az storage blob upload-batch \
+  --source docs/ \
+  --destination content \
+  --account-name airplusstore24 \
+  --auth-mode key
+```
+
+Verify the upload:
+
+```bash
+az storage blob list \
+  --container-name content \
+  --account-name airplusstore24 \
+  --auth-mode key \
+  --output table
+```
+
+You should see files listed under `airplus_intelligence/` and `portal/` prefixes.
+
+---
+
+## Step 7 — Build the Docker image
 
 Run from the repository root (where `Dockerfile` lives):
 
@@ -122,7 +160,7 @@ The first build takes 2–10 minutes depending on your machine and platform. Sub
 
 ---
 
-## Step 7 — Push the image to Azure Container Registry
+## Step 8 — Push the image to Azure Container Registry
 
 ```bash
 # Authenticate Docker with your ACR instance
@@ -134,7 +172,7 @@ docker push airplusacr.azurecr.io/airplus-assist:latest
 
 ---
 
-## Step 8 — Complete the Container App deployment
+## Step 9 — Complete the Container App deployment
 
 Re-run the same Bicep command from Step 4. Bicep is idempotent — existing resources are left unchanged. This time the Container App will succeed because the image now exists in the registry.
 
@@ -152,7 +190,7 @@ az deployment group create \
 
 ---
 
-## Step 9 — Verify the deployment
+## Step 10 — Verify the deployment
 
 ```bash
 # Get the public URL
@@ -169,11 +207,13 @@ Open the URL in a browser, or hit the health endpoint:
 curl https://<fqdn>/api/health
 ```
 
-On first startup the app ingests all documents into Azure AI Search (embeds via Azure OpenAI, uploads to the index). This takes **30–120 seconds** depending on the size of the document corpus. The homepage shows a "Loading knowledge base…" page until it is ready.
+On the **first** startup the Azure AI Search index is empty, so the app automatically downloads all documents from Blob Storage and ingests them (embeds via Azure OpenAI, uploads to the index). This takes **30–120 seconds** depending on corpus size. The homepage shows a "Loading knowledge base…" page until ready.
+
+On all **subsequent** startups (including after code redeployments or scale-up from zero), the index already has documents so ingest is skipped — the app is ready in under 5 seconds.
 
 ---
 
-## Step 10 — Smoke test
+## Step 11 — Smoke test
 
 ```bash
 curl -s -X POST https://<fqdn>/api/ask \
@@ -203,7 +243,24 @@ az containerapp update \
   --image airplusacr.azurecr.io/airplus-assist:latest
 ```
 
-The app re-ingests documents on every startup. For large corpora this adds to cold start time. To avoid re-ingesting on every restart, add a check in `ingest_documents()` that skips upload if the index already contains the expected document count.
+The app skips ingest on startup if the index already has documents, so redeployments are fast. To update the knowledge base after adding or changing documents in Blob Storage, trigger a manual re-ingest:
+
+```bash
+# 1. Upload the new or changed file
+az storage blob upload \
+  --container-name content \
+  --name "portal/new-guide.pdf" \
+  --file path/to/new-guide.pdf \
+  --account-name airplusstore24 \
+  --auth-mode key
+
+# 2. Trigger re-ingest (returns immediately, runs in background)
+curl -X POST https://<fqdn>/api/ingest
+
+# 3. Monitor until complete
+curl https://<fqdn>/api/health
+# "status": "ingesting" while running → "status": "ok" when done
+```
 
 ---
 

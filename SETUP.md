@@ -1,6 +1,6 @@
 # AirPlus Assist — Setup Guide
 
-Step-by-step guide for new team members to get 
+Step-by-step guide for new team members to get
 AirPlus Assist running locally after cloning.
 
 ---
@@ -13,9 +13,10 @@ Install these before starting:
 |------|---------|----------|
 | Docker Desktop | Latest | docker.com/products/docker-desktop |
 | Git | Latest | git-scm.com |
-| Python 3.11+ | Any | python.org (optional — for tests only) |
+| Azure CLI | Latest | learn.microsoft.com/cli/azure/install-azure-cli |
+| Python 3.12+ | Any | python.org (optional — for local dev and tests) |
 
-Minimum hardware: 16GB RAM, 20GB free disk space.
+Minimum hardware: 8GB RAM, 5GB free disk space.
 
 ---
 
@@ -28,19 +29,43 @@ cd airplus-assist
 
 ---
 
-## Step 2 — Get the required files
+## Step 2 — Get the required credentials
 
-Two files are NOT in the repository for security 
-reasons. Get these from the project owner:
+One file is NOT in the repository for security reasons.
+Get it from the project owner:
 
 **`.env`** — environment configuration  
 Copy to the project root: `airplus-assist/.env`
 
-**`docs/` folder** — knowledge base documents  
-Copy the entire docs/ folder to the project root.
-Structure should be:
+It must contain:
+
+```ini
+AZURE_OPENAI_ENDPOINT=https://<name>.openai.azure.com/
+AZURE_OPENAI_API_KEY=<key>
+AZURE_OPENAI_EMBED_MODEL=text-embedding-3-small
+AZURE_OPENAI_CHAT_MODEL=gpt-4o-mini
+AZURE_OPENAI_API_VERSION=2024-02-01
+
+AZURE_SEARCH_ENDPOINT=https://<name>.search.windows.net
+AZURE_SEARCH_KEY=<key>
+AZURE_SEARCH_INDEX=airplus-assist
+
+AZURE_STORAGE_CONNECTION_STRING=DefaultEndpointsProtocol=https;AccountName=<name>;AccountKey=<key>;EndpointSuffix=core.windows.net
+AZURE_STORAGE_CONTAINER=content
 ```
-docs/
+
+> **Note:** Documents are stored in Azure Blob Storage, not in the
+> repository. You do not need a local `docs/` folder to run the app.
+
+---
+
+## Step 3 — Upload documents to Azure Blob Storage
+
+Documents live in the `content` container in Azure Blob Storage.
+The folder structure determines the product name:
+
+```
+content/                          ← Blob container
 ├── airplus_intelligence/
 │   ├── glossary.xlsx
 │   ├── attribute_information.xlsx
@@ -52,72 +77,69 @@ docs/
     └── (other portal documents)
 ```
 
----
-
-## Step 3 — Start Docker Desktop
-
-Open Docker Desktop and wait for it to be ready 
-(whale icon in taskbar stops animating).
-
----
-
-## Step 4 — Start all containers
+If documents are not yet in Blob Storage, upload them:
 
 ```bash
-docker compose up
+# Upload your local docs/ folder to the blob container
+az storage blob upload-batch \
+  --source docs/ \
+  --destination content \
+  --connection-string "<AZURE_STORAGE_CONNECTION_STRING from .env>"
 ```
 
-First run will download images (~2GB). 
-Subsequent runs start in under 30 seconds.
-
-You should see 4 containers running:
-- airplus-assist-ollama-1
-- airplus-assist-chromadb-1
-- airplus-assist-api-1
-- airplus-assist-ui-1
+Skip this step if documents are already in Blob Storage (production
+is already populated — you only need to do this for a fresh environment).
 
 ---
 
-## Step 5 — Pull the AI model
+## Step 4 — Run the application
 
-**Do this once — takes 5-10 minutes (4.4GB download)**
+### Option A — Docker (recommended)
 
 ```bash
-docker exec -it airplus-assist-ollama-1 \
-  ollama pull qwen2.5:7b
+docker build -t airplus-assist .
+docker run --env-file .env -p 8000:8000 airplus-assist
 ```
 
-Do this on a good WiFi connection. 
-The model is stored in a Docker volume and 
-persists across restarts.
-
----
-
-## Step 6 — Ingest the knowledge base
+### Option B — Local Python
 
 ```bash
-docker compose --profile ingest run --rm ingest \
-  python build_vectorstore.py
+cd neo-app
+pip install -r requirements.txt
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
-
-Expected output:
-```
-Total chunks stored: ~1500+
-No errors. All files ingested successfully.
-```
-
-This takes 2-5 minutes depending on corpus size.
-Re-run this whenever documents are added or updated.
 
 ---
 
-## Step 7 — Open the UI
+## Step 5 — First startup (automatic ingest)
 
-http://localhost:8501
+On the first run against an empty Azure AI Search index, the app
+automatically downloads all documents from Blob Storage and ingests them.
+This takes 1–3 minutes depending on corpus size.
+
+```
+=== AirPlus Assist starting — blob container: content ===
+Step 1/2 — Checking Azure AI Search index …
+Index is empty — downloading from Blob Storage and ingesting …
+Downloaded 12 file(s) from blob container 'content'
+Ingesting product 'airplus_intelligence': 847 chunks
+Ingesting product 'portal': 312 chunks
+Step 2/2 — Building RAG pipeline (1159 chunks) …
+=== Ready — 1159 chunks, 2 product(s) ===
+```
+
+On all subsequent startups the index is already populated, so ingest
+is skipped and the app is ready in under 5 seconds.
 
 ---
 
-## Step 8 — Run regression tests
+## Step 6 — Open the UI
+
+http://localhost:8000
+
+---
+
+## Step 7 — Run regression tests
 
 Verify everything is working:
 
@@ -134,55 +156,54 @@ Expected: 33 tests, all passing.
 ## Daily workflow
 
 ```bash
-# Start everything
-docker compose up
-
-# Stop everything
-Ctrl+C   (or docker compose down)
+# Start the app
+docker run --env-file .env -p 8000:8000 airplus-assist
+# or: uvicorn app.main:app ... (Option B)
 
 # Add new documents
-# 1. Drop files into docs/airplus_intelligence/ 
-#    or docs/portal/
-# 2. Re-ingest:
-docker compose --profile ingest run --rm ingest \
-  python build_vectorstore.py
-# Or click Refresh Knowledge Base in the UI
+# 1. Upload the file to Blob Storage:
+az storage blob upload \
+  --container-name content \
+  --name "portal/new-guide.pdf" \
+  --file path/to/new-guide.pdf \
+  --connection-string "<connection string>"
 
-# Switch AI model (optional)
-# Edit OLLAMA_MODEL in .env, then:
-docker compose restart api
+# 2. Trigger re-indexing:
+curl -X POST http://localhost:8000/api/ingest
+
+# 3. Monitor progress:
+curl http://localhost:8000/api/health
+# Wait until "status": "ok" and chunk_count increases
+
+# Check app health
+curl http://localhost:8000/api/health
 ```
 
 ---
 
 ## Troubleshooting
 
-**"Cannot connect to Docker daemon"**  
-Docker Desktop is not running. Open it and wait 
-for the whale icon to stop animating.
+**App shows "Loading knowledge base…" indefinitely**  
+Check the container logs. If you see `AZURE_STORAGE_CONNECTION_STRING is not set`,
+the `.env` file is missing or not loaded.
 
-**"Model not found" error**  
-Run Step 5 again to pull the model.
+**"Index is empty — downloading from Blob Storage" but no documents appear**  
+The Blob container is empty. Run Step 3 to upload documents.
 
-**UI shows no answers**  
-Run Step 6 to ingest documents into ChromaDB.
+**`AZURE_OPENAI_API_KEY` or `AZURE_SEARCH_KEY` errors**  
+The `.env` file has incorrect credentials. Get the latest from the project owner.
+
+**POST /api/ingest returns 409**  
+An ingest is already in progress. Check `GET /api/health` and wait for
+`"ingest_running": false`.
 
 **Tests failing**  
-Check all 4 containers are running:
-```bash
-docker compose ps
-```
-All should show "running" or "healthy".
+Ensure the app is running (`docker run ...` or `uvicorn ...`) and the index
+is populated (`GET /api/health` shows `"status": "ok"`).
 
-**Port already in use**  
-Another service is using port 8501 or 8001.
-Stop it or change the port in docker-compose.yml.
-
-**Windows: line ending issues**  
-```bash
-git config --global core.autocrlf false
-# Then re-clone the repo
-```
+**Port 8000 already in use**  
+Another service is using port 8000. Stop it or change `-p 8000:8000` to
+`-p 8080:8000` and open http://localhost:8080.
 
 ---
 
@@ -190,31 +211,31 @@ git config --global core.autocrlf false
 
 ```
 airplus-assist/
-├── api/              ← FastAPI RAG pipeline
-│   ├── main.py       ← API endpoints
-│   ├── rag_chain.py  ← Retrieval + LLM logic
-│   └── models.py     ← Request/response schemas
-├── ingest/           ← Document ingestion
-│   ├── parsers/      ← PDF, Excel, Word, URL parsers
-│   ├── chunker.py    ← Text splitting
-│   └── embedder.py   ← Sentence transformers
-├── ui/               ← Streamlit frontend
-│   └── app.py        ← Chat + Draft Reply UI
-├── tests/            ← Regression test suite
-├── docs/             ← Knowledge base (gitignored)
-├── .streamlit/       ← Streamlit theme config
-├── .env              ← Config (gitignored)
-├── .env.example      ← Config template
-├── CONTENT_GUIDE.md  ← Document authoring standards
-├── CLAUDE.md         ← AI architecture + Claude Code guide
-└── docker-compose.yml
+├── neo-app/              ← Current application (Azure stack)
+│   ├── app/
+│   │   ├── main.py       ← FastAPI endpoints + startup logic
+│   │   ├── rag.py        ← Retrieval + LLM pipeline
+│   │   ├── ingest.py     ← Parsers, chunking, Blob download, Search upload
+│   │   ├── config.py     ← Environment variable configuration
+│   │   └── models.py     ← Request/response schemas
+│   ├── templates/        ← Jinja2 HTML templates
+│   └── static/           ← CSS, JS assets
+├── tests/                ← Regression test suite
+├── main.bicep            ← Azure infrastructure as code
+├── Dockerfile            ← Container image definition
+├── .env                  ← Config (gitignored)
+├── .env.example          ← Config template
+├── DEPLOYMENT.md         ← Azure deployment guide
+├── TROUBLESHOOTING.md    ← Known issues and fixes
+└── CLAUDE.md             ← AI architecture + Claude Code guide
 ```
 
 ---
 
 ## Getting help
 
-- Read CONTENT_GUIDE.md before adding documents
+- Read DEPLOYMENT.md for deploying to Azure
+- Read TROUBLESHOOTING.md for known deployment issues
 - Read CLAUDE.md before making code changes
 - Run regression tests after any code change
-- Contact the project owner for .env and docs/
+- Contact the project owner for `.env` credentials

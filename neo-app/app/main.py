@@ -19,7 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from .config import config
-from .ingest import IngestSummary, ingest_documents
+from .ingest import IngestSummary, ingest_documents, get_index_document_count, download_from_blob
 from .models import (
     AskRequest,
     AskResponse,
@@ -40,19 +40,66 @@ BASE_DIR = Path(__file__).parent
 _ingest_summary: IngestSummary | None = None
 _pipeline: RagPipeline | None = None
 _startup_error: str | None = None
+_ingest_running: bool = False
+
+
+def _build_summary_from_index() -> IngestSummary:
+    """Reconstruct IngestSummary from the live index without re-ingesting."""
+    from azure.core.credentials import AzureKeyCredential
+    from azure.search.documents import SearchClient
+    sc = SearchClient(
+        endpoint=config.azure_search_endpoint,
+        index_name=config.azure_search_index,
+        credential=AzureKeyCredential(config.azure_search_key),
+    )
+    count_result = sc.search(search_text="*", top=0, include_total_count=True)
+    total = count_result.get_count() or 0
+    # Collect distinct product names without relying on facets (works with old indexes too)
+    products: set[str] = set()
+    ingested_at = ""
+    for doc in sc.search(search_text="*", top=1000, select=["product", "ingested_at"]):
+        if doc.get("product"):
+            products.add(doc["product"])
+        if not ingested_at and doc.get("ingested_at"):
+            ingested_at = doc["ingested_at"]
+    summary = IngestSummary()
+    summary.products, summary.total, summary.ingested_at = sorted(products), total, ingested_at
+    return summary
+
+
+def _run_ingest_from_blob() -> IngestSummary:
+    """Download docs from Blob to a temp dir and run ingest_documents()."""
+    import tempfile
+    import shutil
+    tmp = tempfile.mkdtemp(prefix="airplus-ingest-")
+    try:
+        if download_from_blob(Path(tmp)) == 0:
+            log.warning("Blob container is empty — nothing to ingest.")
+            return IngestSummary()
+        return ingest_documents(tmp)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        log.info("Temp ingest dir cleaned up")
 
 
 async def _run_startup() -> None:
-    """Ingest documents into Azure AI Search and build the RAG pipeline."""
+    """Check index population; skip ingest if already loaded, otherwise download from Blob."""
     global _ingest_summary, _pipeline, _startup_error
     try:
         loop = asyncio.get_event_loop()
 
-        log.info("Step 1/2 — Ingesting documents into Azure AI Search …")
-        _ingest_summary = await loop.run_in_executor(None, ingest_documents, config.documents_path)
+        log.info("Step 1/2 — Checking Azure AI Search index …")
+        doc_count = await loop.run_in_executor(None, get_index_document_count)
 
-        if _ingest_summary.total == 0:
-            log.warning("No documents found — add files to DOCUMENTS_PATH and restart.")
+        if doc_count > 0:
+            log.info("Index has %d document(s) — skipping ingest, building pipeline …", doc_count)
+            _ingest_summary = await loop.run_in_executor(None, _build_summary_from_index)
+        else:
+            log.info("Index is empty — downloading from Blob Storage and ingesting …")
+            _ingest_summary = await loop.run_in_executor(None, _run_ingest_from_blob)
+
+        if not _ingest_summary or _ingest_summary.total == 0:
+            log.warning("No documents found. Upload files to Blob Storage and call POST /api/ingest.")
             return
 
         log.info("Step 2/2 — Building RAG pipeline (%d chunks) …", _ingest_summary.total)
@@ -67,8 +114,8 @@ async def _run_startup() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info("=== AirPlus Assist (neo-app) starting — documents path: %s ===",
-             config.documents_path)
+    log.info("=== AirPlus Assist (neo-app) starting — blob container: %s ===",
+             config.azure_storage_container)
     # Fire-and-forget: server binds immediately, startup runs in background
     asyncio.create_task(_run_startup())
     yield
@@ -95,7 +142,7 @@ def _require() -> RagPipeline:
         raise HTTPException(
             status_code=503,
             detail="RAG pipeline is not available. "
-                   "Ensure documents exist in DOCUMENTS_PATH and restart the app.",
+                   "Ensure documents are in Azure Blob Storage and call POST /api/ingest.",
         )
     return _pipeline
 
@@ -131,7 +178,7 @@ _STARTING_PAGE = """<!DOCTYPE html>
       <span class="dot"></span><span class="dot"></span><span class="dot"></span>
       <br><br>Loading knowledge base…
     </div>
-    <div class="detail">Ingesting documents into Azure AI Search.<br>This takes about 10–20 seconds.</div>
+    <div class="detail">Loading knowledge base from Azure AI Search.<br>This takes about 3–10 seconds.</div>
   </div>
 </body>
 </html>"""
@@ -164,14 +211,45 @@ async def index(request: Request):
 @app.get("/api/health")
 async def health():
     return {
-        "status":      "ok" if _pipeline else "no_documents",
-        "chat_model":  config.azure_openai_chat_model,
-        "embed_model": config.azure_openai_embed_model,
-        "search_index": config.azure_search_index,
-        "chunk_count": _ingest_summary.total       if _ingest_summary else 0,
-        "products":    _ingest_summary.products    if _ingest_summary else [],
-        "ingested_at": _ingest_summary.ingested_at if _ingest_summary else "",
+        "status":         "ingesting" if _ingest_running else ("ok" if _pipeline else "no_documents"),
+        "ingest_running": _ingest_running,
+        "chat_model":     config.azure_openai_chat_model,
+        "embed_model":    config.azure_openai_embed_model,
+        "search_index":   config.azure_search_index,
+        "chunk_count":    _ingest_summary.total       if _ingest_summary else 0,
+        "products":       _ingest_summary.products    if _ingest_summary else [],
+        "ingested_at":    _ingest_summary.ingested_at if _ingest_summary else "",
     }
+
+
+@app.post("/api/ingest", status_code=202)
+async def trigger_ingest():
+    """Trigger a full re-ingest from Azure Blob Storage (runs in background)."""
+    global _ingest_running, _ingest_summary, _pipeline, _startup_error
+
+    if _ingest_running:
+        raise HTTPException(status_code=409, detail="Ingest already in progress.")
+
+    async def _do_ingest():
+        global _ingest_running, _ingest_summary, _pipeline, _startup_error
+        _ingest_running = True
+        try:
+            loop = asyncio.get_event_loop()
+            summary = await loop.run_in_executor(None, _run_ingest_from_blob)
+            if summary.total > 0:
+                _ingest_summary = summary
+                _pipeline = await loop.run_in_executor(None, RagPipeline, summary)
+                log.info("Ingest complete via /api/ingest — %d chunks", summary.total)
+            else:
+                log.warning("/api/ingest: no chunks produced (blob container empty?)")
+        except Exception as exc:
+            _startup_error = str(exc)
+            log.exception("/api/ingest failed: %s", exc)
+        finally:
+            _ingest_running = False
+
+    asyncio.create_task(_do_ingest())
+    return {"status": "accepted", "message": "Ingest started. Monitor via GET /api/health."}
 
 
 @app.get("/api/products")

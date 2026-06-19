@@ -245,6 +245,7 @@ resource caApp 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'AZURE_SEARCH_ENDPOINT', value: 'https://${searchServiceName}.search.windows.net' }
             { name: 'AZURE_SEARCH_KEY', secretRef: 'search-key' }
             { name: 'AZURE_STORAGE_CONNECTION_STRING', secretRef: 'storage-connection' }
+            { name: 'AZURE_STORAGE_CONTAINER', value: 'content' }
           ]
         }
       ]

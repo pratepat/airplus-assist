@@ -74,6 +74,56 @@ def _get_index_client() -> SearchIndexClient:
     return _index_client
 
 
+# ── Index population check ─────────────────────────────────────────────────────
+
+def get_index_document_count() -> int:
+    """Return the number of documents in the index, or 0 if empty/missing."""
+    try:
+        client = _get_index_client()
+        if config.azure_search_index not in set(client.list_index_names()):
+            return 0
+        sc = _get_search_client()
+        result = sc.search(search_text="*", top=0, include_total_count=True)
+        return result.get_count() or 0
+    except Exception as exc:
+        log.warning("Could not read index document count: %s", exc)
+        return 0
+
+
+# ── Blob Storage download ──────────────────────────────────────────────────────
+
+def download_from_blob(dest_dir: Path) -> int:
+    """
+    Download all blobs from AZURE_STORAGE_CONTAINER into dest_dir,
+    preserving the {product}/{filename} folder structure.
+    Returns count of files downloaded.
+    """
+    if not config.azure_storage_connection:
+        raise RuntimeError("AZURE_STORAGE_CONNECTION_STRING is not set.")
+
+    from azure.storage.blob import BlobServiceClient
+
+    service = BlobServiceClient.from_connection_string(config.azure_storage_connection)
+    container = service.get_container_client(config.azure_storage_container)
+
+    count = 0
+    for blob in container.list_blobs():
+        parts = blob.name.split("/", 1)
+        if len(parts) != 2 or not parts[1]:
+            log.debug("Skipping blob with unexpected path: %s", blob.name)
+            continue
+        product_name, filename = parts
+        local_dir = dest_dir / product_name
+        local_dir.mkdir(parents=True, exist_ok=True)
+        with open(local_dir / filename, "wb") as fh:
+            container.get_blob_client(blob.name).download_blob().readinto(fh)
+        count += 1
+
+    log.info("Downloaded %d file(s) from blob container '%s'",
+             count, config.azure_storage_container)
+    return count
+
+
 # ── Index management ───────────────────────────────────────────────────────────
 
 def ensure_index() -> None:
@@ -90,7 +140,7 @@ def ensure_index() -> None:
         fields=[
             SimpleField(name="id", type=SearchFieldDataType.String, key=True),
             SearchableField(name="content", type=SearchFieldDataType.String),
-            SimpleField(name="product",       type=SearchFieldDataType.String, filterable=True, retrievable=True),
+            SimpleField(name="product",       type=SearchFieldDataType.String, filterable=True, facetable=True, retrievable=True),
             SimpleField(name="source_file",   type=SearchFieldDataType.String, retrievable=True),
             SimpleField(name="source_type",   type=SearchFieldDataType.String, filterable=True, retrievable=True),
             SimpleField(name="search_stage",  type=SearchFieldDataType.String, filterable=True, retrievable=True),
